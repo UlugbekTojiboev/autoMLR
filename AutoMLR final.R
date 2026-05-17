@@ -2,7 +2,11 @@ library(shiny)
 library(bslib)
 library(shinyjs)
 library(ggplot2)
+library(htmltools)
 
+# =========================================================================
+# CORE APPLICATION LAYOUT (UI)
+# =========================================================================
 ui <- page_navbar(
   title = "autoMLR",
   theme = bs_theme(version = 5, bootswatch = "minty"),
@@ -14,22 +18,27 @@ ui <- page_navbar(
       .search-container { position: relative; width: 250px; }
       .search-container i { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: #aaa; z-index: 10; }
       .search-container input { padding-left: 32px !important; }
+
+      /* Source Selection Grid Layout */
       .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; max-height: 400px; overflow-y: auto; padding: 5px; }
-      .source-item-btn { border: 1px solid #e2e8f0; border-radius: 6px; padding: 15px; text-align: center; background: #fff; width: 100%; display: block; transition: all 0.2s; cursor: pointer; }
+      .source-item-btn { border: 1px solid #e2e8f0; border-radius: 6px; padding: 15px; text-align: center; background: #fff; width: 100%; display: block; transition: all 0.2s; cursor: pointer; text-decoration: none !important; }
       .source-item-btn:hover { border-color: #10b981; background: #f0fdf4; transform: translateY(-2px); }
       .source-item-btn.selected-item { border: 2px solid #10b981 !important; background: #e6fbf1 !important; }
       .source-item-btn i { font-size: 2rem; margin-bottom: 8px; display: block; }
 
-      /* Data Source Branded Colors Restoration */
-      .icon-excel { color: #107c41 !important; }
-      .icon-json { color: #2563eb !important; }
-      .icon-access { color: #a4373a !important; }
-      .icon-sql { color: #e38b00 !important; }
-      .icon-snowflake { color: #29b6f6 !important; }
-      .icon-salesforce { color: #00a1e0 !important; }
-      .icon-orange { color: #ff6f00 !important; }
-      .icon-azure { color: #0078d4 !important; }
-      .icon-code { color: #38bdf8 !important; }
+      /* Power BI Brand Color Palettes */
+      .icon-excel { color: #107c41; }
+      .icon-json { color: #e15729; }
+      .icon-access { color: #a4373a; }
+      .icon-sql { color: #cc292b; }
+      .icon-snowflake { color: #29b5e8; }
+      .icon-salesforce { color: #00a1e0; }
+      .icon-google { color: #4285f4; }
+      .icon-azure { color: #0078d4; }
+      .icon-python { color: #3776ab; }
+      .icon-r { color: #276dc3; }
+
+      .source-ext-label { display: block; font-size: 0.75rem; color: #94a3b8; margin-top: 2px; }
 
       /* Power Query Data Grid Styling */
       .pbi-table-container { overflow-x: auto; max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; background: #fff; }
@@ -143,7 +152,6 @@ ui <- page_navbar(
                     )
                   ),
 
-                  # Bottom Expandable Profile Segment matching Power BI View Layout
                   conditionalPanel(
                     condition = "input.pbi_profile == true",
                     br(),
@@ -168,12 +176,16 @@ ui <- page_navbar(
   )
 )
 
+# =========================================================================
+# SERVER SIDE COMPUTATION ENGINE
+# =========================================================================
 server <- function(input, output, session) {
 
   file_reset_trigger <- reactiveVal(FALSE)
   selected_source <- reactiveVal(NULL)
   active_profile_col <- reactiveVal(NULL)
 
+  # Resets variables and text boxes on clear button interaction
   observeEvent(input$btn_clear_file, {
     shinyjs::runjs("
       $('#file_input').val('');
@@ -191,6 +203,7 @@ server <- function(input, output, session) {
     file_reset_trigger(FALSE)
   })
 
+  # Reactive dataframe file loader
   uploaded_data <- reactive({
     if (file_reset_trigger()) return(NULL)
     req(input$file_input)
@@ -201,9 +214,9 @@ server <- function(input, output, session) {
     df
   })
 
-  # Listen to programmatic click events routed from table headers via JS integration
-  observeEvent(input$selected_pbi_column, {
-    active_profile_col(input$selected_pbi_column)
+  # Syncs custom JS table click actions directly into active tracking variable
+  observeEvent(input$pbi_col_clicked, {
+    active_profile_col(input$pbi_col_clicked)
   })
 
   # --- HUBS / POPUPS MANAGER ---
@@ -237,22 +250,124 @@ server <- function(input, output, session) {
     }
   })
 
+  # Launches unique connection configurations matching Power BI setups
+  observeEvent(input$btn_modal_connect, {
+    req(selected_source())
+    src <- selected_source()
+    removeModal()
+
+    # Custom form field rendering depending on selected type
+    form_fields <- switch(src,
+                          "excel" = tagList(
+                            fileInput("pbi_src_file", "File path / Browse", accept = c(".xlsx", ".xls", ".xlsm")),
+                            checkboxInput("pbi_first_row", "Use first row as headers", value = TRUE)
+                          ),
+                          "json" = tagList(
+                            fileInput("pbi_src_file", "File path / Browse", accept = c(".json")),
+                            textInput("pbi_json_root", "JSON Root Element Path (Optional)")
+                          ),
+                          "access" = tagList(
+                            fileInput("pbi_src_file", "Database filename path", accept = c(".accdb", ".mdb")),
+                            passwordInput("pbi_db_pass", "Database Password (if encrypted)")
+                          ),
+                          "sqldb" = tagList(
+                            textInput("pbi_srv", "Server Address", placeholder = "e.g., localhost\\SQLEXPRESS or sql.domain.com"),
+                            textInput("pbi_db", "Database (Optional)"),
+                            radioButtons("pbi_mode", "Data Connectivity Mode", choices = c("Import", "DirectQuery"), selected = "Import"),
+                            tags$hr(),
+                            textAreaInput("pbi_sql_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
+                          ),
+                          "snow" = tagList(
+                            textInput("pbi_snow_url", "Server URL", placeholder = "e.g., xy12345.east-us-2.azure.snowflakecomputing.com"),
+                            textInput("pbi_wh", "Warehouse"),
+                            textInput("pbi_db", "Database (Optional)"),
+                            tags$hr(),
+                            textAreaInput("pbi_snow_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
+                          ),
+                          "sfobj" = tagList(
+                            radioButtons("pbi_sf_env_obj", "Salesforce Environment", choices = c("Production", "Custom/Sandbox")),
+                            conditionalPanel(
+                              condition = "input.pbi_sf_env_obj == 'Custom/Sandbox'",
+                              textInput("pbi_sf_url_obj", "Custom Login URL", placeholder = "e.g., https://my-company.sandbox.my.salesforce.com")
+                            ),
+                            checkboxInput("pbi_sf_rel", "Include relationship columns", value = TRUE)
+                          ),
+                          "sfrep" = tagList(
+                            radioButtons("pbi_sf_env_rep", "Salesforce Environment", choices = c("Production", "Custom/Sandbox")),
+                            conditionalPanel(
+                              condition = "input.pbi_sf_env_rep == 'Custom/Sandbox'",
+                              textInput("pbi_sf_url_rep", "Custom Login URL", placeholder = "e.g., https://my-company.sandbox.my.salesforce.com")
+                            ),
+                            textInput("pbi_sf_rep_id", "Specific Report Unique ID")
+                          ),
+                          "gbq" = tagList(
+                            textInput("pbi_gbq_proj", "Project ID", placeholder = "e.g., my-google-project"),
+                            tags$div(style = "margin-top: 15px; margin-bottom: 10px;",
+                                     checkboxInput("pbi_gbq_adv_toggle", strong("Advanced options"), value = FALSE)
+                            ),
+                            conditionalPanel(
+                              condition = "input.pbi_gbq_adv_toggle == true",
+                              tags$div(style = "padding-left: 15px; border-left: 2px solid #cbd5e1; margin-bottom: 15px;",
+                                       textAreaInput("pbi_gbq_sql", "SQL statement", rows = 10, placeholder = "SELECT * FROM `project.dataset.table`", width = "100%"),
+                                       textInput("pbi_gbq_billing", "Billing project ID (Optional)"),
+                                       numericInput("pbi_gbq_limit", "Row limit (Optional)", value = NA)
+                              )
+                            ),
+                            span("Connection will utilize your browser context for OAuth2 validation.", style = "font-size:0.8rem; color:gray;")
+                          ),
+                          "databr" = tagList(
+                            textInput("pbi_srv", "Server Hostname URL"),
+                            textInput("pbi_db", "HTTP Path"),
+                            passwordInput("pbi_pass", "Personal Access Token (PAT)"),
+                            tags$hr(),
+                            textAreaInput("pbi_db_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
+                          ),
+                          "py" = tagList(
+                            textAreaInput("pbi_script_area_py", "Python Script Execution Body", rows = 15, placeholder = "import pandas as pd\ndf = pd.read_csv('...')", width = "100%"),
+                            span("Execution is processed locally within sandbox instance memory blocks.", style = "font-size:0.8rem; color:gray;")
+                          ),
+                          "rscript" = tagList(
+                            textAreaInput("pbi_script_area_r", "R Script Execution Body", rows = 15, placeholder = "df <- read.csv('...')", width = "100%"),
+                            span("Execution is processed locally within sandbox instance memory blocks.", style = "font-size:0.8rem; color:gray;")
+                          )
+    )
+
+    showModal(modalDialog(
+      title = paste("Connect to", switch(src, "excel"="Excel Workbook", "json"="JSON File", "access"="Access Database", "sqldb"="SQL Server Database", "snow"="Snowflake Storage Engine", "sfobj"="Salesforce Objects Matrix", "sfrep"="Salesforce Analytical Report", "gbq"="Google BigQuery Warehouse", "databr"="Azure Databricks Link", "py"="Python Script Platform", "rscript"="R Script Platform")),
+      size = "m",
+      easyClose = FALSE,
+      form_fields,
+      footer = tagList(
+        actionButton("btn_back_to_hub", "← Back", class = "btn btn-outline-secondary"),
+        modalButton("Cancel"),
+        actionButton("btn_finalize_connect", "Connect", class = "btn btn-success")
+      )
+    ))
+  })
+
+  # Routes user back to primary grid list if needed
+  observeEvent(input$btn_back_to_hub, {
+    removeModal()
+    click("btn_open_hub")
+  })
+
+  # Populates grid items with targeted brand labels, extensions, and custom CSS classes
   output$filtered_sources_ui <- renderUI({
     search_term <- if (!is.null(input$search_source)) tolower(input$search_source) else ""
     all_sources <- list(
-      list(id = "excel",   name = "Excel workbook",        icon = "fa-file-excel icon-excel"),
-      list(id = "json",    name = "JSON file",             icon = "fa-code icon-json"),
-      list(id = "access",  name = "Access database",       icon = "fa-database icon-access"),
-      list(id = "sqldb",   name = "SQL Server database",   icon = "fa-database icon-sql"),
-      list(id = "snow",    name = "Snowflake",             icon = "fa-snowflake icon-snowflake"),
-      list(id = "sfobj",   name = "Salesforce Objects",    icon = "fa-cloud icon-salesforce"),
-      list(id = "sfrep",   name = "Salesforce Reports",    icon = "fa-chart-bar icon-salesforce"),
-      list(id = "gbq",     name = "Google BigQuery",       icon = "fa-cloud-meatball icon-orange"),
-      list(id = "databr",  name = "Azure Databricks",      icon = "fa-fire icon-azure"),
-      list(id = "py",      name = "Python script",         icon = "fa-brands fa-python icon-code"),
-      list(id = "rscript", name = "R script",              icon = "fa-brands fa-r-project icon-code")
+      list(id = "excel",   name = "Excel workbook",       ext = ".xlsx, .xls, .xlsm",    icon = "fa-file-excel icon-excel"),
+      list(id = "json",    name = "JSON file",             ext = ".json, .txt",           icon = "fa-code icon-json"),
+      list(id = "access",  name = "Access database",       ext = ".accdb, .mdb",          icon = "fa-database icon-access"),
+      list(id = "sqldb",   name = "SQL Server database",   ext = "SQL Engine Tables",     icon = "fa-database icon-sql"),
+      list(id = "snow",    name = "Snowflake",             ext = "Snowflake Cloud Wh",    icon = "fa-snowflake icon-snowflake"),
+      list(id = "sfobj",   name = "Salesforce Objects",    ext = "Cloud CRM Tables",      icon = "fa-cloud icon-salesforce"),
+      list(id = "sfrep",   name = "Salesforce Reports",    ext = "CRM Tabular Reports",   icon = "fa-chart-bar icon-salesforce"),
+      list(id = "gbq",     name = "Google BigQuery",       ext = "BigQuery Analytics",    icon = "fa-cloud-meatball icon-google"),
+      list(id = "databr",  name = "Azure Databricks",      ext = "Spark Cluster Lake",    icon = "fa-fire icon-azure"),
+      list(id = "py",      name = "Python script",         ext = "Local script run",      icon = "fa-brands fa-python icon-python"),
+      list(id = "rscript", name = "R script",              ext = "Local script run",      icon = "fa-brands fa-r-project icon-r")
     )
-    matched <- Filter(function(s) search_term == "" || grepl(search_term, tolower(s$name)), all_sources)
+    matched <- Filter(function(s) search_term == "" || grepl(search_term, tolower(s$name)) || grepl(search_term, tolower(s$ext)), all_sources)
     if (length(matched) == 0) {
       return(div(style = "text-align: center; padding: 40px; color: #94a3b8;",
                  tags$i(class = "fa fa-search-minus", style = "font-size: 3rem; margin-bottom: 10px;"),
@@ -265,13 +380,15 @@ server <- function(input, output, session) {
           actionLink(paste0("select_", s$id),
                      label = div(class = class_string,
                                  tags$i(class = paste("fa", s$icon)),
-                                 tags$span(s$name, style = "color: #334155; font-weight: 500; font-size: 0.9rem;")
+                                 tags$span(s$name, style = "color: #334155; font-weight: 500; font-size: 0.9rem; display:block;"),
+                                 tags$span(s$ext, class = "source-ext-label")
                      )
           )
         })
     )
   })
 
+  # Basic overview textual stats
   output$dataset_name_ui <- renderText({ if (is.null(uploaded_data())) "No file loaded" else input$file_input$name })
   output$dataset_dims_ui <- renderText({ if (is.null(uploaded_data())) "0 rows • 0 columns" else paste(nrow(uploaded_data()), "rows •", ncol(uploaded_data()), "columns") })
   output$total_rows     <- renderText({ if (is.null(uploaded_data())) "0" else nrow(uploaded_data()) })
@@ -286,7 +403,7 @@ server <- function(input, output, session) {
 
     col_names <- colnames(df)
     card_list <- lapply(col_names, function(name) {
-      column_data = df[[name]]
+      column_data <- df[[name]]
       na_count <- sum(is.na(column_data) | as.character(column_data) == "")
       na_pct <- round((na_count / length(column_data)) * 100, 1)
       dist_text <- "N/A (Categorical)"
@@ -332,7 +449,7 @@ server <- function(input, output, session) {
     do.call(tagList, card_list)
   })
 
-  # --- TRANSFORM DATA (POWER BI ENGINE MODULE) ---
+  # --- CUSTOM POWER QUERY DATA TABLE GENERATOR ---
   output$power_bi_table <- renderUI({
     df <- uploaded_data()
     if (is.null(df)) return(p("No data loaded. Go to Overview to upload a file.", style = "padding: 20px; font-style: italic; color: #64748b;"))
@@ -358,11 +475,11 @@ server <- function(input, output, session) {
 
       tags$th(
         class = is_selected_class,
-        onclick = sprintf("Shiny.setInputValue('selected_pbi_column', '%s', {priority: 'event'});", col),
+        onclick = sprintf("Shiny.setInputValue('pbi_col_clicked', '%s', {priority: 'event'});", col),
 
         div(class = "header-top-row",
-            span(ui_type, class = "header-type-label"),
-            div(class = "header-title-text", col)
+            div(class = "header-title-text", col),
+            span(ui_type, class = "header-type-label")
         ),
 
         if(input$pbi_quality) {
@@ -399,7 +516,7 @@ server <- function(input, output, session) {
         lapply(col_names, function(col) {
           val <- preview_df[i, col]
           cell_class <- if(!is.null(selected_col) && selected_col == col) "selected-col-cell" else ""
-          tags$td(class = cell_class, if(is.na(val) || val == "") tags$em("null", style="color:#cbd5e1;") else as.character(val))
+          tags$td(class = cell_class, if(is.na(val) || val == "") tags$em("null", style="color:#cbd5e1;") else htmlEscape(as.character(val)))
         })
       )
     })
@@ -407,7 +524,7 @@ server <- function(input, output, session) {
     tags$table(class = "pbi-table", tags$thead(tags$tr(headers)), tags$tbody(rows))
   })
 
-  # --- SUMMARY STATISTICS DETAILS COMPONENT ---
+  # --- BOTTOM PANEL PROFILE STATISTICS METRIC ---
   output$column_stats_table_ui <- renderUI({
     df <- uploaded_data()
     req(df)
@@ -442,7 +559,7 @@ server <- function(input, output, session) {
                tags$tbody(base_rows))
   })
 
-  # --- DYNAMIC HISTOGRAM PLOT COMPONENT ---
+  # --- PROFILE CHART LAYER COMPONENT ---
   output$profile_histogram_plot <- renderPlot({
     df <- uploaded_data()
     req(df)
