@@ -4,9 +4,6 @@ library(shinyjs)
 library(ggplot2)
 library(htmltools)
 
-# =========================================================================
-# CORE APPLICATION LAYOUT (UI)
-# =========================================================================
 ui <- page_navbar(
   title = "autoMLR",
   theme = bs_theme(version = 5, bootswatch = "minty"),
@@ -18,15 +15,11 @@ ui <- page_navbar(
       .search-container { position: relative; width: 250px; }
       .search-container i { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: #aaa; z-index: 10; }
       .search-container input { padding-left: 32px !important; }
-
-      /* Source Selection Grid Layout */
       .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; max-height: 400px; overflow-y: auto; padding: 5px; }
       .source-item-btn { border: 1px solid #e2e8f0; border-radius: 6px; padding: 15px; text-align: center; background: #fff; width: 100%; display: block; transition: all 0.2s; cursor: pointer; text-decoration: none !important; }
       .source-item-btn:hover { border-color: #10b981; background: #f0fdf4; transform: translateY(-2px); }
       .source-item-btn.selected-item { border: 2px solid #10b981 !important; background: #e6fbf1 !important; }
       .source-item-btn i { font-size: 2rem; margin-bottom: 8px; display: block; }
-
-      /* Power BI Brand Color Palettes */
       .icon-excel { color: #107c41; }
       .icon-json { color: #e15729; }
       .icon-access { color: #a4373a; }
@@ -37,34 +30,23 @@ ui <- page_navbar(
       .icon-azure { color: #0078d4; }
       .icon-python { color: #3776ab; }
       .icon-r { color: #276dc3; }
-
       .source-ext-label { display: block; font-size: 0.75rem; color: #94a3b8; margin-top: 2px; }
-
-      /* Power Query Data Grid Styling */
       .pbi-table-container { overflow-x: auto; max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; background: #fff; }
       .pbi-table { width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 0.82rem; }
       .pbi-table th { background: #f8f9fa; border: 1px solid #dee2e6; padding: 6px; font-weight: normal; vertical-align: top; min-width: 160px; position: sticky; top: 0; z-index: 5; cursor: pointer; user-select: none; }
       .pbi-table th:hover { background: #f1f5f9; }
       .pbi-table td { border: 1px solid #e2e8f0; padding: 4px 8px; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; color: #334155; }
-
-      /* Column Selection Highlighting */
       .pbi-table th.selected-col-header { background: #e2e8f0 !important; border-bottom: 3px solid #0284c7 !important; font-weight: 600; }
       .pbi-table td.selected-col-cell { background-color: #f1f5f9 !important; }
-
-      /* Header Elements styling */
       .header-top-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; pointer-events: none; }
       .header-title-text { font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; }
       .header-type-label { font-weight: 700; color: #64748b; font-size: 0.7rem; background: #e2e8f0; padding: 1px 4px; border-radius: 3px; }
-
-      /* Quality Bar */
       .quality-bar-wrapper { margin-top: 4px; margin-bottom: 4px; pointer-events: none; }
       .quality-bar { display: flex; height: 6px; border-radius: 2px; overflow: hidden; background: #e2e8f0; }
       .q-valid { background-color: #10b981; }
       .q-empty { background-color: #94a3b8; }
       .q-error { background-color: #ef4444; }
       .quality-text-legend { font-size: 0.72rem; color: #475569; display: flex; justify-content: space-between; margin-top: 1px; }
-
-      /* Mini Inline Distribution Plot */
       .mini-dist-container { margin-top: 6px; border-top: 1px dashed #cbd5e1; padding-top: 4px; pointer-events: none; }
       .mini-bar-chart { display: flex; align-items: flex-end; height: 32px; gap: 2px; margin-bottom: 3px; background: #fafafa; padding: 2px; border-radius: 2px; }
       .mini-bar { background-color: #0ea5e9; flex-grow: 1; min-width: 3px; border-radius: 1px 1px 0 0; }
@@ -128,7 +110,7 @@ ui <- page_navbar(
                   br(),
                   div(
                     style = "display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #ddd; padding-top: 15px;",
-                    span("0 actions pending — go to Columns tab to add rules", style = "color: #666; font-size: 0.9rem;"),
+                    span(textOutput("pending_actions_count_ui"), style = "color: #666; font-size: 0.9rem;"),
                     div(
                       actionButton("btn_review", "Review actions", class = "btn-outline-secondary me-2"),
                       actionButton("btn_apply", "Apply cleaning ↗", class = "btn-success")
@@ -143,8 +125,7 @@ ui <- page_navbar(
                       div(style = "display: flex; gap: 25px; align-items: center; flex-wrap: wrap;",
                           strong("Data View Structure Options:", style = "font-size: 0.95rem; color:#475569;"),
                           checkboxInput("pbi_quality", "Column quality", value = TRUE),
-                          checkboxInput("pbi_dist", "Column distribution", value = FALSE),
-                          checkboxInput("pbi_profile", "Column profile", value = FALSE)
+                          checkboxInput("pbi_dist", "Column distribution", value = FALSE)
                       )
                     ),
                     div(class = "pbi-table-container",
@@ -152,38 +133,73 @@ ui <- page_navbar(
                     )
                   ),
 
-                  conditionalPanel(
-                    condition = "input.pbi_profile == true",
-                    br(),
-                    layout_columns(
-                      col_widths = c(4, 8),
-                      card(
-                        card_header(strong("Column statistics")),
-                        uiOutput("column_stats_table_ui")
-                      ),
-                      card(
-                        card_header(strong("Value distribution")),
-                        plotOutput("profile_histogram_plot", height = "260px")
-                      )
+                  br(),
+                  layout_columns(
+                    col_widths = c(4, 4, 4),
+                    card(
+                      card_header(strong("Column statistics")),
+                      uiOutput("column_stats_table_ui")
+                    ),
+                    card(
+                      card_header(strong("Smart Cleaning Toolkit")),
+                      uiOutput("column_transform_ui")
+                    ),
+                    card(
+                      card_header(strong("Value distribution")),
+                      plotOutput("profile_histogram_plot", height = "260px")
                     )
                   )
         ),
 
-        nav_panel("Preview"),
-        nav_panel("Pending actions")
+        nav_panel("Preview",
+                  br(),
+                  card(
+                    card_header(
+                      div(style = "display: flex; justify-content: space-between; align-items: center;",
+                          strong("Dataset Preview Panel (First 500 rows)"),
+                          radioButtons("preview_view_type", "Filter rows:",
+                                       choices = c("All Data" = "all", "Nulls Only" = "nulls"),
+                                       selected = "all", inline = TRUE)
+                      )
+                    ),
+                    div(style = "overflow: auto; max-height: 450px; padding: 10px;",
+                        tableOutput("preview_data_table")
+                    )
+                  )
+        ),
+        nav_panel("Pending actions",
+                  br(),
+                  card(
+                    card_header(strong("Recorded Cleaning Operations & History Log")),
+                    div(style = "overflow: auto; max-height: 450px; padding: 10px;",
+                        tableOutput("pending_actions_table")
+                    )
+                  )
+        )
       )
     )
   )
 )
 
-# =========================================================================
-# SERVER SIDE COMPUTATION ENGINE
-# =========================================================================
 server <- function(input, output, session) {
 
   file_reset_trigger <- reactiveVal(FALSE)
   selected_source <- reactiveVal(NULL)
   active_profile_col <- reactiveVal(NULL)
+  connected_data <- reactiveVal(NULL)
+  connected_data_name <- reactiveVal(NULL)
+
+  # Tracks dataset updates dynamically
+  modified_data <- reactiveVal(NULL)
+
+  # Tracks action rows
+  actions_log <- reactiveVal(data.frame(
+    Time = character(),
+    Column = character(),
+    Action = character(),
+    Details = character(),
+    stringsAsFactors = FALSE
+  ))
 
   # Resets variables and text boxes on clear button interaction
   observeEvent(input$btn_clear_file, {
@@ -195,7 +211,11 @@ server <- function(input, output, session) {
       $('.shiny-input-container .input-group .form-control').val('');
     ")
     file_reset_trigger(TRUE)
+    connected_data(NULL)
+    connected_data_name(NULL)
     active_profile_col(NULL)
+    modified_data(NULL)
+    actions_log(data.frame(Time=character(), Column=character(), Action=character(), Details=character(), stringsAsFactors=FALSE))
     showNotification("Dataset cleared successfully.", type = "warning")
   })
 
@@ -205,13 +225,30 @@ server <- function(input, output, session) {
 
   # Reactive dataframe file loader
   uploaded_data <- reactive({
+    if (!is.null(connected_data())) {
+      return(connected_data())
+    }
     if (file_reset_trigger()) return(NULL)
     req(input$file_input)
+
     df <- read.csv(input$file_input$datapath, stringsAsFactors = FALSE)
     if(ncol(df) > 0 && is.null(active_profile_col())) {
       active_profile_col(colnames(df)[1])
     }
     df
+  })
+
+  observeEvent(uploaded_data(), {
+    req(uploaded_data())
+    modified_data(uploaded_data())
+    actions_log(data.frame(Time=character(), Column=character(), Action=character(), Details=character(), stringsAsFactors=FALSE))
+  })
+
+  current_working_data <- reactive({
+    if (!is.null(modified_data())) {
+      return(modified_data())
+    }
+    uploaded_data()
   })
 
   # Syncs custom JS table click actions directly into active tracking variable
@@ -256,7 +293,6 @@ server <- function(input, output, session) {
     src <- selected_source()
     removeModal()
 
-    # Custom form field rendering depending on selected type
     form_fields <- switch(src,
                           "excel" = tagList(
                             fileInput("pbi_src_file", "File path / Browse", accept = c(".xlsx", ".xls", ".xlsm")),
@@ -271,7 +307,7 @@ server <- function(input, output, session) {
                             passwordInput("pbi_db_pass", "Database Password (if encrypted)")
                           ),
                           "sqldb" = tagList(
-                            textInput("pbi_srv", "Server Address", placeholder = "e.g., localhost\\SQLEXPRESS or sql.domain.com"),
+                            textInput("pbi_srv", "Server Address", placeholder = "e.g., localhost\\\\SQLEXPRESS or sql.domain.com"),
                             textInput("pbi_db", "Database (Optional)"),
                             radioButtons("pbi_mode", "Data Connectivity Mode", choices = c("Import", "DirectQuery"), selected = "Import"),
                             tags$hr(),
@@ -323,7 +359,7 @@ server <- function(input, output, session) {
                             textAreaInput("pbi_db_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
                           ),
                           "py" = tagList(
-                            textAreaInput("pbi_script_area_py", "Python Script Execution Body", rows = 15, placeholder = "import pandas as pd\ndf = pd.read_csv('...')", width = "100%"),
+                            textAreaInput("pbi_script_area_py", "Python Script Execution Body", rows = 15, placeholder = "import pandas as pd\\ndf = pd.read_csv('...')", width = "100%"),
                             span("Execution is processed locally within sandbox instance memory blocks.", style = "font-size:0.8rem; color:gray;")
                           ),
                           "rscript" = tagList(
@@ -345,17 +381,15 @@ server <- function(input, output, session) {
     ))
   })
 
-  # Routes user back to primary grid list if needed
   observeEvent(input$btn_back_to_hub, {
     removeModal()
     click("btn_open_hub")
   })
 
-  # Populates grid items with targeted brand labels, extensions, and custom CSS classes
   output$filtered_sources_ui <- renderUI({
     search_term <- if (!is.null(input$search_source)) tolower(input$search_source) else ""
     all_sources <- list(
-      list(id = "excel",   name = "Excel workbook",       ext = ".xlsx, .xls, .xlsm",    icon = "fa-file-excel icon-excel"),
+      list(id = "excel",   name = "Excel workbook",        ext = ".xlsx, .xls, .xlsm",    icon = "fa-file-excel icon-excel"),
       list(id = "json",    name = "JSON file",             ext = ".json, .txt",           icon = "fa-code icon-json"),
       list(id = "access",  name = "Access database",       ext = ".accdb, .mdb",          icon = "fa-database icon-access"),
       list(id = "sqldb",   name = "SQL Server database",   ext = "SQL Engine Tables",     icon = "fa-database icon-sql"),
@@ -389,16 +423,19 @@ server <- function(input, output, session) {
   })
 
   # Basic overview textual stats
-  output$dataset_name_ui <- renderText({ if (is.null(uploaded_data())) "No file loaded" else input$file_input$name })
-  output$dataset_dims_ui <- renderText({ if (is.null(uploaded_data())) "0 rows • 0 columns" else paste(nrow(uploaded_data()), "rows •", ncol(uploaded_data()), "columns") })
-  output$total_rows     <- renderText({ if (is.null(uploaded_data())) "0" else nrow(uploaded_data()) })
-  output$total_cols     <- renderText({ if (is.null(uploaded_data())) "0" else ncol(uploaded_data()) })
-  output$missing_count  <- renderText({ if (is.null(uploaded_data())) "0" else sum(is.na(uploaded_data())) })
-  output$columns_issues <- renderText({ if (is.null(uploaded_data())) "0" else sum(sapply(uploaded_data(), function(col) any(is.na(col)))) })
+  output$dataset_name_ui <- renderText({
+    if (!is.null(connected_data_name())) return(connected_data_name())
+    if (is.null(current_working_data())) "No file loaded" else input$file_input$name
+  })
+  output$dataset_dims_ui <- renderText({ if (is.null(current_working_data())) "0 rows • 0 columns" else paste(nrow(current_working_data()), "rows •", ncol(current_working_data()), "columns") })
+  output$total_rows     <- renderText({ if (is.null(current_working_data())) "0" else nrow(current_working_data()) })
+  output$total_cols     <- renderText({ if (is.null(current_working_data())) "0" else ncol(current_working_data()) })
+  output$missing_count  <- renderText({ if (is.null(current_working_data())) "0" else sum(is.na(current_working_data()) | as.character(current_working_data()) == "") })
+  output$columns_issues <- renderText({ if (is.null(current_working_data())) "0" else sum(sapply(current_working_data(), function(col) any(is.na(col) | as.character(col) == ""))) })
 
   # --- OVERVIEW DATA DISPLAY CARDS ---
   output$column_cards_container <- renderUI({
-    df <- uploaded_data()
+    df <- current_working_data()
     if (is.null(df)) return(p("Please upload a dataset file to generate column evaluations.", style = "color: gray; font-style: italic;"))
 
     col_names <- colnames(df)
@@ -449,9 +486,22 @@ server <- function(input, output, session) {
     do.call(tagList, card_list)
   })
 
+  output$pending_actions_count_ui <- renderText({
+    n <- nrow(actions_log())
+    paste(n, "transformations completed & logged. View history on the Pending Actions page.")
+  })
+
+  observeEvent(input$btn_review, {
+    updateNavsetPill(session, "main_tabs", selected = "Pending actions")
+  })
+
+  observeEvent(input$btn_apply, {
+    showNotification("All current cleaning logic passes successfully locked into state!", type = "success")
+  })
+
   # --- CUSTOM POWER QUERY DATA TABLE GENERATOR ---
   output$power_bi_table <- renderUI({
-    df <- uploaded_data()
+    df <- current_working_data()
     if (is.null(df)) return(p("No data loaded. Go to Overview to upload a file.", style = "padding: 20px; font-style: italic; color: #64748b;"))
 
     preview_df <- head(df, 1000)
@@ -472,6 +522,9 @@ server <- function(input, output, session) {
       unique_cnt <- sum(table(col_vec) == 1)
 
       is_selected_class <- if(!is.null(selected_col) && selected_col == col) "selected-col-header" else ""
+
+      table_counts <- table(head(col_vec, 100))
+      max_count <- if(length(table_counts) > 0) max(table_counts) else 1
 
       tags$th(
         class = is_selected_class,
@@ -498,8 +551,8 @@ server <- function(input, output, session) {
         if(input$pbi_dist) {
           div(class = "mini-dist-container",
               div(class = "mini-bar-chart",
-                  lapply(head(as.numeric(table(head(col_vec, 100))), 8), function(val) {
-                    pct_h <- min(100, max(15, round((val / max(table(col_vec))) * 100)))
+                  lapply(head(as.numeric(table_counts), 8), function(val) {
+                    pct_h <- min(100, max(15, round((val / max_count) * 100)))
                     div(class = "mini-bar", style = paste0("height: ", pct_h, "%;"))
                   })
               ),
@@ -511,22 +564,158 @@ server <- function(input, output, session) {
       )
     })
 
-    rows <- lapply(1:nrow(preview_df), function(i) {
-      tags$tr(
-        lapply(col_names, function(col) {
-          val <- preview_df[i, col]
-          cell_class <- if(!is.null(selected_col) && selected_col == col) "selected-col-cell" else ""
-          tags$td(class = cell_class, if(is.na(val) || val == "") tags$em("null", style="color:#cbd5e1;") else htmlEscape(as.character(val)))
-        })
-      )
-    })
+    rows <- NULL
+    if (nrow(preview_df) > 0) {
+      rows <- lapply(1:nrow(preview_df), function(i) {
+        tags$tr(
+          lapply(col_names, function(col) {
+            val <- preview_df[i, col]
+            cell_class <- if(!is.null(selected_col) && selected_col == col) "selected-col-cell" else ""
+            tags$td(class = cell_class, if(is.na(val) || val == "") tags$em("null", style="color:#cbd5e1;") else htmlEscape(as.character(val)))
+          })
+        )
+      })
+    }
 
     tags$table(class = "pbi-table", tags$thead(tags$tr(headers)), tags$tbody(rows))
   })
 
+  # --- INTERACTIVE COLUMN TRANSFORMATION PANEL ---
+  output$column_transform_ui <- renderUI({
+    df <- current_working_data()
+    req(df)
+    col <- active_profile_col()
+
+    if (is.null(col) || !(col %in% colnames(df))) {
+      return(p("Click a header column to begin transformation configurations.", style = "color: gray; font-style: italic;"))
+    }
+
+    is_num <- is.numeric(df[[col]])
+
+    tagList(
+      p(HTML(paste0("Active Column Target: <strong>", htmlEscape(col), "</strong>"))),
+
+      selectInput("trans_type", "Convert Column Data Type:",
+                  choices = c("No Change" = "none", "Numeric" = "numeric", "Text/Character" = "character", "Factor" = "factor")),
+
+      checkboxInput("trans_trim", "Trim Whitespace (Leading/Trailing)", value = FALSE),
+
+      selectInput("trans_case", "Modify String Case Structure:",
+                  choices = c("No Change" = "none", "UPPERCASE" = "upper", "lowercase" = "lower", "Title Case" = "title")),
+
+      tags$hr(),
+      tags$h6("Handle Missing Values"),
+      if (is_num) {
+        selectInput("impute_numeric_col", "For This Numeric Column:",
+                    choices = c("Keep Nulls" = "keep", "Replace with Mean" = "mean", "Replace with Median" = "median", "Drop Rows" = "drop"))
+      } else {
+        textInput("impute_text_val_col", "For This Text Column (Replace with word):", value = "Unknown")
+      },
+
+      br(),
+      actionButton("btn_apply_col_trans", "Execute Column Transforms", class = "btn-primary w-100 btn-sm")
+    )
+  })
+
+  observeEvent(input$btn_apply_col_trans, {
+    col <- active_profile_col()
+    req(col)
+    df <- current_working_data()
+    req(df)
+
+    actions <- c()
+    details_log <- c()
+
+    # 1. Handling Whitespace Trim
+    if (input$trans_trim) {
+      df[[col]] <- trimws(as.character(df[[col]]))
+      actions <- c(actions, "Trimmed whitespace")
+      details_log <- c(details_log, "Trimmed leading/trailing spaces")
+    }
+
+    # 2. Handling Case Transformations
+    if (input$trans_case == "upper") {
+      df[[col]] <- toupper(as.character(df[[col]]))
+      actions <- c(actions, "Changed Case")
+      details_log <- c(details_log, "Changed case to UPPERCASE")
+    } else if (input$trans_case == "lower") {
+      df[[col]] <- tolower(as.character(df[[col]]))
+      actions <- c(actions, "Changed Case")
+      details_log <- c(details_log, "Changed case to lowercase")
+    } else if (input$trans_case == "title") {
+      df[[col]] <- tools::toTitleCase(tolower(as.character(df[[col]])))
+      actions <- c(actions, "Changed Case")
+      details_log <- c(details_log, "Changed case to Title Case")
+    }
+
+    # 3. Handling Type Conversions
+    if (input$trans_type == "numeric") {
+      df[[col]] <- as.numeric(df[[col]])
+      actions <- c(actions, "Convert Type")
+      details_log <- c(details_log, "Converted layout profile type to Numeric")
+    } else if (input$trans_type == "character") {
+      df[[col]] <- as.character(df[[col]])
+      actions <- c(actions, "Convert Type")
+      details_log <- c(details_log, "Converted layout profile type to Text")
+    } else if (input$trans_type == "factor") {
+      df[[col]] <- as.factor(df[[col]])
+      actions <- c(actions, "Convert Type")
+      details_log <- c(details_log, "Converted layout profile type to Factor")
+    }
+
+    # 4. Handling Column Imputation Rules
+    col_vec <- df[[col]]
+    if (is.numeric(col_vec)) {
+      req(input$impute_numeric_col)
+      na_indices <- which(is.na(col_vec))
+      if (length(na_indices) > 0 && input$impute_numeric_col != "keep") {
+        if (input$impute_numeric_col == "mean") {
+          m_val <- mean(col_vec, na.rm = TRUE)
+          if (is.nan(m_val)) m_val <- 0
+          df[na_indices, col] <- m_val
+          actions <- c(actions, "Impute Numeric")
+          details_log <- c(details_log, paste("Replaced NULLs with Mean =", round(m_val, 2)))
+        } else if (input$impute_numeric_col == "median") {
+          med_val <- median(col_vec, na.rm = TRUE)
+          if (is.na(med_val)) med_val <- 0
+          df[na_indices, col] <- med_val
+          actions <- c(actions, "Impute Numeric")
+          details_log <- c(details_log, paste("Replaced NULLs with Median =", round(med_val, 2)))
+        } else if (input$impute_numeric_col == "drop") {
+          df <- df[-na_indices, , drop = FALSE]
+          actions <- c(actions, "Drop Rows")
+          details_log <- c(details_log, "Dropped row instances with NULLs")
+        }
+      }
+    } else {
+      req(input$impute_text_val_col)
+      na_indices <- which(is.na(col_vec) | as.character(col_vec) == "")
+      if (length(na_indices) > 0) {
+        df[na_indices, col] <- input$impute_text_val_col
+        actions <- c(actions, "Impute Text")
+        details_log <- c(details_log, paste0("Replaced missing blanks with '", input$impute_text_val_col, "'"))
+      }
+    }
+
+    if (length(actions) > 0) {
+      new_rows <- data.frame(
+        Time = rep(format(Sys.time(), "%H:%M:%S"), length(actions)),
+        Column = rep(col, length(actions)),
+        Action = actions,
+        Details = details_log,
+        stringsAsFactors = FALSE
+      )
+      actions_log(rbind(actions_log(), new_rows))
+      modified_data(df)
+      showNotification(paste("Success: Custom updates parsed onto column:", col), type = "message")
+    } else {
+      showNotification("No transformation fields changed.", type = "warning")
+    }
+  })
+
   # --- BOTTOM PANEL PROFILE STATISTICS METRIC ---
   output$column_stats_table_ui <- renderUI({
-    df <- uploaded_data()
+    df <- current_working_data()
     req(df)
     col <- active_profile_col()
     if(is.null(col) || !(col %in% colnames(df))) return(p("Click on a header column.", style="color:#64748b;"))
@@ -555,13 +744,14 @@ server <- function(input, output, session) {
       base_rows <- c(base_rows, numeric_rows)
     }
 
-    tags$table(class = "table table-sm table-striped style='font-size:0.8rem; margin:0;'",
+    tags$table(class = "table table-sm table-striped",
+               style = "font-size:0.8rem; margin:0;",
                tags$tbody(base_rows))
   })
 
   # --- PROFILE CHART LAYER COMPONENT ---
   output$profile_histogram_plot <- renderPlot({
-    df <- uploaded_data()
+    df <- current_working_data()
     req(df)
     col <- active_profile_col()
     req(col)
@@ -583,7 +773,7 @@ server <- function(input, output, session) {
     } else {
       top_df <- as.data.frame(table(Value = col_vec))
       top_df <- top_df[order(-top_df$Freq), ]
-      top_df <- head(top_df, 15)
+      top_df = head(top_df, 15)
 
       ggplot(top_df, aes(x = reorder(Value, -Freq), y = Freq)) +
         geom_col(fill = "#0ea5e9", alpha = 0.9, width = 0.75) +
@@ -596,6 +786,66 @@ server <- function(input, output, session) {
         )
     }
   })
+
+  # --- DATA PREVIEW FILTER LOGIC ---
+  output$preview_data_table <- renderTable({
+    df <- current_working_data()
+    req(df)
+
+    if (input$preview_view_type == "nulls") {
+      has_null <- apply(df, 1, function(row) {
+        any(is.na(row) | as.character(row) == "")
+      })
+      filtered_df <- df[has_null, , drop = FALSE]
+      if (nrow(filtered_df) == 0) {
+        return(data.frame(Message = "No null rows detected inside the current data frame!"))
+      }
+      return(head(filtered_df, 500))
+    } else {
+      return(head(df, 500))
+    }
+  })
+
+  # --- PENDING ACTIONS ACTION LOG TABLE ---
+  output$pending_actions_table <- renderTable({
+    log_df <- actions_log()
+    if (nrow(log_df) == 0) {
+      return(data.frame(Status = "No custom data adjustments tracked in this log session yet."))
+    }
+    log_df
+  })
+
+  # --- EXPORT INTERACTIVE SYSTEM MODAL ---
+  observeEvent(input$btn_export, {
+    showModal(modalDialog(
+      title = "Export Cleaned Dataset Options",
+      p("Please choose your desired configuration profile file type format below:"),
+      div(style = "display: flex; gap: 12px; justify-content: center; padding: 20px;",
+          downloadButton("download_csv", "CSV File Output", class = "btn-success"),
+          downloadButton("download_txt", "Text (.txt) Output", class = "btn-info text-white"),
+          downloadButton("download_xls", "Excel Workbook Output", class = "btn-primary")
+      ),
+      size = "m",
+      easyClose = TRUE,
+      footer = modalButton("Dismiss")
+    ))
+  })
+
+  output$download_csv <- downloadHandler(
+    filename = function() { paste0("cleaned_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv") },
+    content = function(file) { write.csv(current_working_data(), file, row.names = FALSE) }
+  )
+
+  output$download_txt <- downloadHandler(
+    filename = function() { paste0("cleaned_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".txt") },
+    content = function(file) { write.table(current_working_data(), file, sep = "\t", row.names = FALSE, quote = FALSE) }
+  )
+
+  output$download_xls <- downloadHandler(
+    filename = function() { paste0("cleaned_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xls") },
+    content = function(file) { write.table(current_working_data(), file, sep = "\t", row.names = FALSE) }
+  )
 }
 
+options(shiny.maxRequestSize = 200 * 1024^2)
 shinyApp(ui, server)
