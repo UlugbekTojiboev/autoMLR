@@ -1,152 +1,393 @@
+
 library(shiny)
 library(bslib)
 library(shinyjs)
 library(ggplot2)
 library(htmltools)
 
+# ---------------------------------------------------------------------------
+# Pure-R imputation helpers (replace the removed Rcpp cppFunction calls)
+# R's vectorised ifelse + mean/median are fast enough for typical datasets;
+# no compiler toolchain required.
+# ---------------------------------------------------------------------------
+
+# Replace every NA in numeric vector x with the column mean
+r_impute_mean <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  if (is.nan(m)) m <- 0
+  x[is.na(x)] <- m
+  x
+}
+
+# Replace every NA in numeric vector x with the column median
+r_impute_median <- function(x) {
+  md <- median(x, na.rm = TRUE)
+  if (is.na(md)) md <- 0
+  x[is.na(x)] <- md
+  x
+}
+
+# ---------------------------------------------------------------------------
+# replay_steps() — pure function, no side effects
+# Takes the original loaded dataframe and the current step list,
+# applies every step in order, returns the resulting dataframe.
+# This is what makes X-removal correct: remove a step, replay from origin.
+# ---------------------------------------------------------------------------
+replay_steps <- function(origin_df, steps) {
+  df <- origin_df
+  if (length(steps) == 0) return(df)
+
+  for (s in steps) {
+    col    <- s$col   # may be NA for dataset-level ops
+    action <- s$action
+
+    # ── Dataset-level operations ──────────────────────────────────────────
+    if (action == "remove_duplicates") {
+      df <- df[!duplicated(df), , drop = FALSE]
+      next
+    }
+    if (action == "first_row_headers") {
+      if (nrow(df) < 1) next
+      new_names    <- as.character(unlist(df[1, ]))
+      df           <- df[-1, , drop = FALSE]
+      colnames(df) <- make.names(new_names, unique = TRUE)
+      rownames(df) <- NULL
+      next
+    }
+
+    # Guard: column must still exist after prior steps
+    if (is.na(col) || !(col %in% colnames(df))) next
+
+    # ── Type conversion ───────────────────────────────────────────────────
+    if (action == "convert_type") {
+      df[[col]] <- switch(s$to_type,
+                          numeric   = suppressWarnings(as.numeric(df[[col]])),
+                          character = as.character(df[[col]]),
+                          factor    = as.factor(df[[col]]),
+                          date      = suppressWarnings(as.Date(df[[col]])),
+                          binary    = { raw <- tolower(trimws(as.character(df[[col]]))); ifelse(raw %in% c("1","yes","true","y","t"), 1L, 0L) },
+                          df[[col]]
+      )
+    }
+
+    # ── Rounding ──────────────────────────────────────────────────────────
+    if (action == "round_values" && is.numeric(df[[col]])) {
+      df[[col]] <- round(df[[col]], digits = s$digits)
+    }
+
+    # ── Trim whitespace ───────────────────────────────────────────────────
+    if (action == "trim_whitespace") {
+      df[[col]] <- trimws(as.character(df[[col]]))
+    }
+
+    # ── String case ───────────────────────────────────────────────────────
+    if (action == "change_case") {
+      df[[col]] <- switch(s$case,
+                          upper = toupper(as.character(df[[col]])),
+                          lower = tolower(as.character(df[[col]])),
+                          title = tools::toTitleCase(tolower(as.character(df[[col]]))),
+                          df[[col]]
+      )
+    }
+
+    # ── Split by delimiter ────────────────────────────────────────────────
+    if (action == "split_column") {
+      df[[col]] <- vapply(as.character(df[[col]]), function(x) {
+        parts <- strsplit(x, s$delim, fixed = TRUE)[[1]]
+        if (length(parts) >= s$part) trimws(parts[s$part]) else NA_character_
+      }, character(1))
+    }
+
+    # ── Trim to N characters ──────────────────────────────────────────────
+    if (action == "trim_chars") {
+      n <- s$nchars; side <- s$side
+      df[[col]] <- vapply(as.character(df[[col]]), function(x) {
+        if (is.na(x)) return(NA_character_)
+        if (side == "left") substr(x, 1, n) else substr(x, max(1L, nchar(x)-n+1L), nchar(x))
+      }, character(1))
+    }
+
+    # ── Imputation ────────────────────────────────────────────────────────
+    if (action == "impute") {
+      cv <- df[[col]]
+      if (s$method == "drop") {
+        na_idx <- which(is.na(cv) | as.character(cv) == "")
+        if (length(na_idx) > 0) df <- df[-na_idx, , drop = FALSE]
+      } else if (s$method == "mean" && is.numeric(cv)) {
+        df[[col]] <- r_impute_mean(cv)
+      } else if (s$method == "median" && is.numeric(cv)) {
+        df[[col]] <- r_impute_median(cv)
+      } else if (s$method == "constant") {
+        na_idx <- which(is.na(cv) | as.character(cv) == "")
+        if (length(na_idx) > 0) df[na_idx, col] <- s$fill_value
+      }
+    }
+  }
+  df
+}
+
+# ---------------------------------------------------------------------------
+# step_label() — human-readable one-liner for the Applied Steps panel
+# ---------------------------------------------------------------------------
+step_label <- function(s) {
+  switch(s$action,
+         remove_duplicates  = "Remove Duplicate Rows",
+         first_row_headers  = "Use First Row as Headers",
+         convert_type       = paste0("Changed Type: ", s$col, " → ", s$to_type),
+         round_values       = paste0("Rounded: ",      s$col, " (", s$digits, " dp)"),
+         trim_whitespace    = paste0("Trim Whitespace: ", s$col),
+         change_case        = paste0("Case: ",          s$col, " → ", s$case),
+         split_column       = paste0("Split: ",         s$col, " by '", s$delim, "' part ", s$part),
+         trim_chars         = paste0("Trim Chars: ",    s$col, " → ", s$nchars, " (", s$side, ")"),
+         impute             = paste0("Impute: ",        s$col, " → ", s$method,
+                                     if (!is.null(s$fill_value)) paste0(" ('", s$fill_value, "')") else ""),
+         s$action
+  )
+}
+
+# ---------------------------------------------------------------------------
+# step_settings_html() — detailed view for the gear-icon modal
+# ---------------------------------------------------------------------------
+step_settings_html <- function(s) {
+  rows <- switch(s$action,
+                 remove_duplicates = list(c("Operation", "Remove duplicate rows across all columns")),
+                 first_row_headers = list(c("Operation", "Promote first data row to column headers")),
+                 convert_type      = list(c("Column", s$col), c("Convert to", s$to_type)),
+                 round_values      = list(c("Column", s$col), c("Decimal places", s$digits)),
+                 trim_whitespace   = list(c("Column", s$col), c("Operation", "trimws() — leading & trailing")),
+                 change_case       = list(c("Column", s$col), c("Case", s$case)),
+                 split_column      = list(c("Column", s$col), c("Delimiter", s$delim), c("Keep part", s$part)),
+                 trim_chars        = list(c("Column", s$col), c("Max characters", s$nchars), c("Side", s$side)),
+                 impute            = {
+                   base <- list(c("Column", s$col), c("Method", s$method))
+                   if (!is.null(s$fill_value)) base <- c(base, list(c("Fill value", s$fill_value)))
+                   base
+                 },
+                 list(c("Action", s$action))
+  )
+  tbl_rows <- lapply(rows, function(r)
+    tags$tr(tags$td(strong(r[[1]]), style="width:140px;color:#475569;"),
+            tags$td(r[[2]], style="color:#1e293b;")))
+  tags$table(class="table table-sm table-bordered",
+             style="font-size:.85rem;margin:0;",
+             tags$tbody(tbl_rows))
+}
+
+# ===========================================================================
+# UI
+# ===========================================================================
 ui <- page_navbar(
   title = "autoMLR",
   theme = bs_theme(version = 5, bootswatch = "minty"),
 
   header = tags$head(
-    shinyjs::useShinyjs(),
-    tags$link(rel = "stylesheet", href = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"),
+    useShinyjs(),
+    tags$link(rel="stylesheet",
+              href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"),
     tags$style(HTML("
-      .search-container { position: relative; width: 250px; }
-      .search-container i { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: #aaa; z-index: 10; }
-      .search-container input { padding-left: 32px !important; }
-      .source-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; max-height: 400px; overflow-y: auto; padding: 5px; }
-      .source-item-btn { border: 1px solid #e2e8f0; border-radius: 6px; padding: 15px; text-align: center; background: #fff; width: 100%; display: block; transition: all 0.2s; cursor: pointer; text-decoration: none !important; }
-      .source-item-btn:hover { border-color: #10b981; background: #f0fdf4; transform: translateY(-2px); }
-      .source-item-btn.selected-item { border: 2px solid #10b981 !important; background: #e6fbf1 !important; }
-      .source-item-btn i { font-size: 2rem; margin-bottom: 8px; display: block; }
-      .icon-excel { color: #107c41; }
-      .icon-json { color: #e15729; }
-      .icon-access { color: #a4373a; }
-      .icon-sql { color: #cc292b; }
-      .icon-snowflake { color: #29b5e8; }
-      .icon-salesforce { color: #00a1e0; }
-      .icon-google { color: #4285f4; }
-      .icon-azure { color: #0078d4; }
-      .icon-python { color: #3776ab; }
-      .icon-r { color: #276dc3; }
-      .source-ext-label { display: block; font-size: 0.75rem; color: #94a3b8; margin-top: 2px; }
-      .pbi-table-container { overflow-x: auto; max-height: 400px; overflow-y: auto; border: 1px solid #dee2e6; background: #fff; }
-      .pbi-table { width: 100%; border-collapse: collapse; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 0.82rem; }
-      .pbi-table th { background: #f8f9fa; border: 1px solid #dee2e6; padding: 6px; font-weight: normal; vertical-align: top; min-width: 160px; position: sticky; top: 0; z-index: 5; cursor: pointer; user-select: none; }
-      .pbi-table th:hover { background: #f1f5f9; }
-      .pbi-table td { border: 1px solid #e2e8f0; padding: 4px 8px; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; color: #334155; }
-      .pbi-table th.selected-col-header { background: #e2e8f0 !important; border-bottom: 3px solid #0284c7 !important; font-weight: 600; }
-      .pbi-table td.selected-col-cell { background-color: #f1f5f9 !important; }
-      .header-top-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; pointer-events: none; }
-      .header-title-text { font-weight: 600; color: #1e293b; overflow: hidden; text-overflow: ellipsis; }
-      .header-type-label { font-weight: 700; color: #64748b; font-size: 0.7rem; background: #e2e8f0; padding: 1px 4px; border-radius: 3px; }
-      .quality-bar-wrapper { margin-top: 4px; margin-bottom: 4px; pointer-events: none; }
-      .quality-bar { display: flex; height: 6px; border-radius: 2px; overflow: hidden; background: #e2e8f0; }
-      .q-valid { background-color: #10b981; }
-      .q-empty { background-color: #94a3b8; }
-      .q-error { background-color: #ef4444; }
-      .quality-text-legend { font-size: 0.72rem; color: #475569; display: flex; justify-content: space-between; margin-top: 1px; }
-      .mini-dist-container { margin-top: 6px; border-top: 1px dashed #cbd5e1; padding-top: 4px; pointer-events: none; }
-      .mini-bar-chart { display: flex; align-items: flex-end; height: 32px; gap: 2px; margin-bottom: 3px; background: #fafafa; padding: 2px; border-radius: 2px; }
-      .mini-bar { background-color: #0ea5e9; flex-grow: 1; min-width: 3px; border-radius: 1px 1px 0 0; }
-      .mini-dist-counts { font-size: 0.72rem; color: #64748b; font-style: italic; text-align: left; }
+      /* ── Source hub grid ── */
+      .search-container{position:relative;width:250px}
+      .search-container i{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:#aaa;z-index:10}
+      .search-container input{padding-left:32px!important}
+      .source-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;max-height:400px;overflow-y:auto;padding:5px}
+      .source-item-btn{border:1px solid #e2e8f0;border-radius:6px;padding:15px;text-align:center;background:#fff;width:100%;display:block;transition:all .2s;cursor:pointer;text-decoration:none!important}
+      .source-item-btn:hover{border-color:#10b981;background:#f0fdf4;transform:translateY(-2px)}
+      .source-item-btn.selected-item{border:2px solid #10b981!important;background:#e6fbf1!important}
+      .source-item-btn i{font-size:2rem;margin-bottom:8px;display:block}
+      .icon-excel{color:#107c41}.icon-json{color:#e15729}.icon-access{color:#a4373a}
+      .icon-sql{color:#cc292b}.icon-snowflake{color:#29b5e8}.icon-salesforce{color:#00a1e0}
+      .icon-google{color:#4285f4}.icon-azure{color:#0078d4}.icon-python{color:#3776ab}.icon-r{color:#276dc3}
+      .source-ext-label{display:block;font-size:.75rem;color:#94a3b8;margin-top:2px}
+      /* ── Power Query table ── */
+      .pbi-table-container{overflow-x:auto;max-height:400px;overflow-y:auto;border:1px solid #dee2e6;background:#fff}
+      .pbi-table{width:100%;border-collapse:collapse;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:.82rem}
+      .pbi-table th{background:#f8f9fa;border:1px solid #dee2e6;padding:6px;font-weight:normal;vertical-align:top;min-width:160px;position:sticky;top:0;z-index:5;cursor:pointer;user-select:none}
+      .pbi-table th:hover{background:#f1f5f9}
+      .pbi-table td{border:1px solid #e2e8f0;padding:4px 8px;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;color:#334155}
+      .pbi-table th.selected-col-header{background:#e2e8f0!important;border-bottom:3px solid #0284c7!important;font-weight:600}
+      .pbi-table td.selected-col-cell{background-color:#f1f5f9!important}
+      .header-top-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;pointer-events:none}
+      .header-title-text{font-weight:600;color:#1e293b;overflow:hidden;text-overflow:ellipsis}
+      .header-type-label{font-weight:700;color:#64748b;font-size:.7rem;background:#e2e8f0;padding:1px 4px;border-radius:3px}
+      .quality-bar-wrapper{margin-top:4px;margin-bottom:4px;pointer-events:none}
+      .quality-bar{display:flex;height:6px;border-radius:2px;overflow:hidden;background:#e2e8f0}
+      .q-valid{background-color:#10b981}.q-empty{background-color:#94a3b8}.q-error{background-color:#ef4444}
+      .quality-text-legend{font-size:.72rem;color:#475569;display:flex;justify-content:space-between;margin-top:1px}
+      .mini-dist-container{margin-top:6px;border-top:1px dashed #cbd5e1;padding-top:4px;pointer-events:none}
+      .mini-bar-chart{display:flex;align-items:flex-end;height:32px;gap:2px;margin-bottom:3px;background:#fafafa;padding:2px;border-radius:2px}
+      .mini-bar{background-color:#0ea5e9;flex-grow:1;min-width:3px;border-radius:1px 1px 0 0}
+      .mini-dist-counts{font-size:.72rem;color:#64748b;font-style:italic;text-align:left}
+      /* ── Applied Steps panel ── */
+      .steps-panel{border:1px solid #e2e8f0;border-radius:8px;background:#fff;overflow:hidden}
+      .steps-panel-header{background:#f8fafc;padding:10px 14px;border-bottom:1px solid #e2e8f0;display:flex;justify-content:space-between;align-items:center}
+      .steps-panel-header strong{font-size:.9rem;color:#1e293b}
+      .step-item{display:flex;align-items:center;padding:7px 12px;border-bottom:1px solid #f1f5f9;font-size:.82rem;color:#334155;gap:6px}
+      .step-item:last-child{border-bottom:none}
+      .step-item:hover{background:#f8fafc}
+      .step-dot{width:8px;height:8px;border-radius:50%;background:#10b981;flex-shrink:0}
+      .step-label{flex-grow:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .step-gear{background:none;border:none;color:#94a3b8;padding:2px 5px;cursor:pointer;font-size:.8rem;border-radius:3px;flex-shrink:0}
+      .step-gear:hover{background:#e2e8f0;color:#475569}
+      .step-remove{background:none;border:none;color:#fca5a5;padding:2px 5px;cursor:pointer;font-size:.8rem;border-radius:3px;flex-shrink:0}
+      .step-remove:hover{background:#fee2e2;color:#ef4444}
+      .steps-empty{padding:18px 14px;color:#94a3b8;font-size:.82rem;font-style:italic;text-align:center}
+      /* ── Right-click context menu ── */
+      #col-ctx-menu{position:fixed;z-index:9999;background:#fff;border:1px solid #e2e8f0;border-radius:8px;box-shadow:0 4px 24px rgba(0,0,0,.12);min-width:220px;padding:6px 0;display:none}
+      .ctx-item{padding:8px 16px;font-size:.84rem;color:#334155;cursor:pointer;display:flex;align-items:center;gap:10px}
+      .ctx-item:hover{background:#f0fdf4;color:#10b981}
+      .ctx-item.disabled{color:#cbd5e1;cursor:not-allowed;pointer-events:none}
+      .ctx-item i{width:16px;text-align:center;font-size:.85rem}
+      .ctx-separator{border:none;border-top:1px solid #f1f5f9;margin:4px 0}
+      /* ── Misc ── */
+      .toolkit-section-label{font-size:.78rem;font-weight:600;color:#475569;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;margin-top:10px}
+    ")),
+
+    # ── Right-click context menu (injected once) ──────────────────────────
+    tags$div(id = "col-ctx-menu",
+             tags$div(class="ctx-item", id="ctx-type",    tags$i(class="fa fa-exchange-alt"), "Change Data Type"),
+             tags$div(class="ctx-item", id="ctx-round",   tags$i(class="fa fa-hashtag"),      "Round Values"),
+             tags$hr(class="ctx-separator"),
+             tags$div(class="ctx-item", id="ctx-trim-ws", tags$i(class="fa fa-eraser"),       "Trim Whitespace"),
+             tags$div(class="ctx-item", id="ctx-case",    tags$i(class="fa fa-font"),         "Change Case"),
+             tags$div(class="ctx-item", id="ctx-split",   tags$i(class="fa fa-cut"),          "Split Column"),
+             tags$div(class="ctx-item", id="ctx-nchar",   tags$i(class="fa fa-text-width"),   "Trim by Characters"),
+             tags$hr(class="ctx-separator"),
+             tags$div(class="ctx-item", id="ctx-impute",  tags$i(class="fa fa-magic"),        "Handle Missing Values"),
+             tags$div(class="ctx-item", id="ctx-dupes",   tags$i(class="fa fa-clone"),        "Remove Duplicates")
+    ),
+
+    # ── JS: right-click on .pbi-table th, dismiss on click-away ──────────
+    tags$script(HTML("
+      $(document).on('contextmenu', '.pbi-table th', function(e) {
+        e.preventDefault();
+        var col = $(this).data('col');
+        var isNum = $(this).data('numeric') === true || $(this).data('numeric') === 'true';
+        Shiny.setInputValue('ctx_col',  col,   {priority:'event'});
+        Shiny.setInputValue('ctx_isnum', isNum, {priority:'event'});
+        // enable/disable items based on column type
+        if (isNum) {
+          // numeric column: Round ON, text ops OFF
+          $('#ctx-round').removeClass('disabled');
+          $('#ctx-trim-ws, #ctx-case, #ctx-split, #ctx-nchar').addClass('disabled');
+        } else {
+          // text column: Round OFF, text ops ON
+          $('#ctx-round').addClass('disabled');
+          $('#ctx-trim-ws, #ctx-case, #ctx-split, #ctx-nchar').removeClass('disabled');
+        }
+        var menu = $('#col-ctx-menu');
+        menu.css({ top: e.clientY + 'px', left: e.clientX + 'px', display: 'block' });
+      });
+      $(document).on('click', function(e) {
+        if (!$(e.target).closest('#col-ctx-menu').length) $('#col-ctx-menu').hide();
+      });
+      // Wire each menu item to fire a Shiny input
+      ['ctx-type','ctx-round','ctx-trim-ws','ctx-case',
+       'ctx-split','ctx-nchar','ctx-impute','ctx-dupes'].forEach(function(id) {
+        $('#' + id).on('click', function() {
+          if ($(this).hasClass('disabled')) return;
+          Shiny.setInputValue('ctx_action', id, {priority:'event'});
+          $('#col-ctx-menu').hide();
+        });
+      });
     "))
   ),
 
   nav_panel(
     title = "Data Cleaner",
     layout_sidebar(
+
+      # ── Left sidebar: Data Source ────────────────────────────────────────
       sidebar = sidebar(
-        title = "DATA SOURCE",
-        width = 300,
-
-        fileInput("file_input", "Drop file here",
-                  accept = c(".csv"),
-                  buttonLabel = "Browse...",
-                  placeholder = "CSV • XLSX • JSON • Parquet"),
-
+        title = "DATA SOURCE", width = 300,
+        fileInput("file_input", "Drop file here", accept = ".csv",
+                  buttonLabel = "Browse...", placeholder = "CSV • XLSX • JSON • Parquet"),
         actionButton("btn_clear_file", "❌ Clear Current File",
                      class = "btn-outline-danger w-100 btn-sm",
-                     style = "margin-top: -10px; margin-bottom: 15px;"),
-
+                     style = "margin-top:-10px;margin-bottom:15px;"),
         tags$hr(),
         tags$h5("Connections"),
-
         actionButton("btn_open_hub", "⚡ Connect with Source Data",
                      class = "btn-outline-secondary w-100 text-start",
-                     style = "border-color: #ced4da;"),
-
+                     style = "border-color:#ced4da;"),
         tags$hr(),
-
         tags$h5("Loaded dataset"),
         strong(textOutput("dataset_name_ui")),
-        span(textOutput("dataset_dims_ui"), style = "color: #666; font-size: 0.9rem;"),
+        span(textOutput("dataset_dims_ui"), style = "color:#666;font-size:.9rem;"),
+        br(), br(),
 
-        br(), br(), br(),
-
+        # ── Persistent buttons (always in sidebar as requested) ───────────
+        div(class = "toolkit-section-label", "Dataset Operations"),
+        div(style = "display:flex;flex-direction:column;gap:6px;",
+            actionButton("btn_use_first_row_hdr", "↑ Use First Row as Headers",
+                         class = "btn-outline-secondary w-100 btn-sm"),
+            actionButton("btn_apply_col_trans",   "▶ Execute Column Transforms",
+                         class = "btn-primary w-100 btn-sm")
+        ),
+        br(),
         actionButton("btn_export", "↓ Export clean data", class = "btn-outline-dark w-100")
       ),
 
+      # ── Main content ─────────────────────────────────────────────────────
       navset_pill(
         id = "main_tabs",
+
         nav_panel("Overview",
                   br(),
                   layout_columns(
-                    value_box(title = "Total rows", value = textOutput("total_rows"), theme = "success"),
-                    value_box(title = "Columns", value = textOutput("total_cols"), theme = "light"),
-                    value_box(title = "Missing values", value = textOutput("missing_count"), theme = "light"),
-                    value_box(title = "Columns with issues", value = textOutput("columns_issues"), theme = "danger"),
-                    col_widths = c(3, 3, 3, 3)
+                    value_box("Total rows",          textOutput("total_rows"),     theme="success"),
+                    value_box("Columns",             textOutput("total_cols"),     theme="light"),
+                    value_box("Missing values",      textOutput("missing_count"),  theme="light"),
+                    value_box("Columns with issues", textOutput("columns_issues"), theme="danger"),
+                    col_widths = c(3,3,3,3)
                   ),
                   br(),
-                  div(
-                    style = "display: flex; justify-content: space-between; align-items: center;",
-                    tags$h4("Column health overview"),
-                    span("Scroll to review all", class = "badge bg-light text-dark", style = "border: 1px solid #ddd;")
-                  ),
+                  div(style="display:flex;justify-content:space-between;align-items:center;",
+                      tags$h4("Column health overview"),
+                      span("Scroll to review all", class="badge bg-light text-dark",
+                           style="border:1px solid #ddd;")),
                   br(),
                   uiOutput("column_cards_container"),
                   br(),
-                  div(
-                    style = "display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #ddd; padding-top: 15px;",
-                    span(textOutput("pending_actions_count_ui"), style = "color: #666; font-size: 0.9rem;"),
-                    div(
-                      actionButton("btn_review", "Review actions", class = "btn-outline-secondary me-2"),
-                      actionButton("btn_apply", "Apply cleaning ↗", class = "btn-success")
-                    )
-                  )
+                  div(style="display:flex;justify-content:space-between;align-items:center;border-top:1px solid #ddd;padding-top:15px;",
+                      span(textOutput("pending_actions_count_ui"), style="color:#666;font-size:.9rem;"),
+                      actionButton("btn_review","Review applied steps", class="btn-outline-secondary"))
         ),
 
         nav_panel("Columns",
                   br(),
-                  card(
-                    card_header(
-                      div(style = "display: flex; gap: 25px; align-items: center; flex-wrap: wrap;",
-                          strong("Data View Structure Options:", style = "font-size: 0.95rem; color:#475569;"),
-                          checkboxInput("pbi_quality", "Column quality", value = TRUE),
-                          checkboxInput("pbi_dist", "Column distribution", value = FALSE)
+                  # ── Two-column layout: table on left, Applied Steps on right ─────
+                  layout_columns(
+                    col_widths = c(9, 3),
+
+                    div(
+                      card(
+                        card_header(
+                          div(style="display:flex;gap:25px;align-items:center;flex-wrap:wrap;",
+                              strong("Data View:", style="font-size:.95rem;color:#475569;"),
+                              checkboxInput("pbi_quality","Column quality",    value=TRUE),
+                              checkboxInput("pbi_dist",   "Column distribution",value=FALSE))
+                        ),
+                        div(class="pbi-table-container", uiOutput("power_bi_table"))
+                      ),
+                      br(),
+                      layout_columns(
+                        col_widths = c(4,4,4),
+                        card(card_header(strong("Column statistics")), uiOutput("column_stats_table_ui")),
+                        card(card_header(strong("Active Column")),     uiOutput("active_col_info_ui")),
+                        card(card_header(strong("Value distribution")),plotOutput("profile_histogram_plot",height="220px"))
                       )
                     ),
-                    div(class = "pbi-table-container",
-                        uiOutput("power_bi_table")
-                    )
-                  ),
 
-                  br(),
-                  layout_columns(
-                    col_widths = c(4, 4, 4),
-                    card(
-                      card_header(strong("Column statistics")),
-                      uiOutput("column_stats_table_ui")
-                    ),
-                    card(
-                      card_header(strong("Smart Cleaning Toolkit")),
-                      uiOutput("column_transform_ui")
-                    ),
-                    card(
-                      card_header(strong("Value distribution")),
-                      plotOutput("profile_histogram_plot", height = "260px")
+                    # ── Applied Steps panel ────────────────────────────────────────
+                    div(
+                      div(class="steps-panel",
+                          div(class="steps-panel-header",
+                              strong("Applied Steps"),
+                              actionButton("btn_clear_all_steps", "Clear All",
+                                           class="btn btn-outline-danger btn-sm",
+                                           style="font-size:.75rem;padding:2px 8px;")),
+                          uiOutput("applied_steps_ui")
+                      )
                     )
                   )
         ),
@@ -155,25 +396,23 @@ ui <- page_navbar(
                   br(),
                   card(
                     card_header(
-                      div(style = "display: flex; justify-content: space-between; align-items: center;",
-                          strong("Dataset Preview Panel (First 500 rows)"),
-                          radioButtons("preview_view_type", "Filter rows:",
-                                       choices = c("All Data" = "all", "Nulls Only" = "nulls"),
-                                       selected = "all", inline = TRUE)
-                      )
+                      div(style="display:flex;justify-content:space-between;align-items:center;",
+                          strong("Dataset Preview (First 500 rows)"),
+                          radioButtons("preview_view_type","Filter rows:",
+                                       choices=c("All Data"="all","Nulls Only"="nulls"),
+                                       selected="all",inline=TRUE))
                     ),
-                    div(style = "overflow: auto; max-height: 450px; padding: 10px;",
-                        tableOutput("preview_data_table")
-                    )
+                    div(style="overflow:auto;max-height:450px;padding:10px;",
+                        tableOutput("preview_data_table"))
                   )
         ),
-        nav_panel("Pending actions",
+
+        nav_panel("Applied Steps Log",
                   br(),
                   card(
-                    card_header(strong("Recorded Cleaning Operations & History Log")),
-                    div(style = "overflow: auto; max-height: 450px; padding: 10px;",
-                        tableOutput("pending_actions_table")
-                    )
+                    card_header(strong("Full Transformation Log")),
+                    div(style="overflow:auto;max-height:450px;padding:10px;",
+                        tableOutput("steps_log_table"))
                   )
         )
       )
@@ -181,670 +420,717 @@ ui <- page_navbar(
   )
 )
 
+
+# ===========================================================================
+# SERVER
+# ===========================================================================
 server <- function(input, output, session) {
 
-  file_reset_trigger <- reactiveVal(FALSE)
-  selected_source <- reactiveVal(NULL)
-  active_profile_col <- reactiveVal(NULL)
-  connected_data <- reactiveVal(NULL)
+  # ── MASTER STATE ───────────────────────────────────────────────────────────
+  # origin_df()  — the raw dataframe as loaded; NEVER mutated after load
+  # step_list()  — ordered list of step param objects
+  # dataset()    — derived: replay_steps(origin_df(), step_list())
+  #                recomputed whenever step_list changes
+  # active_col() — currently selected column name
+  # ctx_col()    — column targeted by the right-click menu
+  # pending_step — reactiveValues holding partial step params while modal open
+  # ──────────────────────────────────────────────────────────────────────────
+  origin_df    <- reactiveVal(NULL)
+  step_list    <- reactiveVal(list())
+  active_col   <- reactiveVal(NULL)
+  ctx_col      <- reactiveVal(NULL)
+  selected_source     <- reactiveVal(NULL)
   connected_data_name <- reactiveVal(NULL)
+  pending      <- reactiveValues(action=NULL, col=NULL)
 
-  # Tracks dataset updates dynamically
-  modified_data <- reactiveVal(NULL)
-
-  # Tracks action rows
-  actions_log <- reactiveVal(data.frame(
-    Time = character(),
-    Column = character(),
-    Action = character(),
-    Details = character(),
-    stringsAsFactors = FALSE
-  ))
-
-  # Resets variables and text boxes on clear button interaction
-  observeEvent(input$btn_clear_file, {
-    shinyjs::runjs("
-      $('#file_input').val('');
-      $('#file_input_placeholder').val('');
-      $('.progress-bar').css('width', '0%').text('');
-      $('.progress').hide();
-      $('.shiny-input-container .input-group .form-control').val('');
-    ")
-    file_reset_trigger(TRUE)
-    connected_data(NULL)
-    connected_data_name(NULL)
-    active_profile_col(NULL)
-    modified_data(NULL)
-    actions_log(data.frame(Time=character(), Column=character(), Action=character(), Details=character(), stringsAsFactors=FALSE))
-    showNotification("Dataset cleared successfully.", type = "warning")
+  # dataset() is always replay_steps(origin, steps) — derived, never stored
+  dataset <- reactive({
+    df <- origin_df()
+    if (is.null(df)) return(NULL)
+    replay_steps(df, step_list())
   })
 
+  # ── Helper: append a step and invalidate dataset ──────────────────────────
+  add_step <- function(step) {
+    step_list(c(step_list(), list(step)))
+  }
+
+  # ── Helper: remove step by index and replay ───────────────────────────────
+  remove_step <- function(idx) {
+    s <- step_list()
+    if (idx < 1 || idx > length(s)) return()
+    step_list(s[-idx])
+  }
+
+  # ── FILE UPLOAD ────────────────────────────────────────────────────────────
   observeEvent(input$file_input, {
-    file_reset_trigger(FALSE)
-  })
-
-  # Reactive dataframe file loader
-  uploaded_data <- reactive({
-    if (!is.null(connected_data())) {
-      return(connected_data())
-    }
-    if (file_reset_trigger()) return(NULL)
     req(input$file_input)
-
-    df <- read.csv(input$file_input$datapath, stringsAsFactors = FALSE)
-    if(ncol(df) > 0 && is.null(active_profile_col())) {
-      active_profile_col(colnames(df)[1])
-    }
-    df
+    df <- tryCatch(read.csv(input$file_input$datapath, stringsAsFactors=FALSE),
+                   error = function(e) { showNotification(paste("Read error:", e$message), type="error"); NULL })
+    req(df)
+    origin_df(df)
+    step_list(list())
+    active_col(colnames(df)[1])
+    connected_data_name(NULL)
+    showNotification(paste0("Loaded: ", nrow(df), " rows × ", ncol(df), " columns"), type="message")
   })
 
-  observeEvent(uploaded_data(), {
-    req(uploaded_data())
-    modified_data(uploaded_data())
-    actions_log(data.frame(Time=character(), Column=character(), Action=character(), Details=character(), stringsAsFactors=FALSE))
+  # ── CLEAR FILE ─────────────────────────────────────────────────────────────
+  observeEvent(input$btn_clear_file, {
+    shinyjs::runjs("var fi=document.getElementById('file_input'); if(fi) fi.value='';
+                    document.querySelectorAll('.progress').forEach(function(el){el.style.display='none';});")
+    origin_df(NULL); step_list(list()); active_col(NULL); connected_data_name(NULL)
+    showNotification("Dataset cleared.", type="warning")
   })
 
-  current_working_data <- reactive({
-    if (!is.null(modified_data())) {
-      return(modified_data())
-    }
-    uploaded_data()
+  # ── CLEAR ALL STEPS ────────────────────────────────────────────────────────
+  observeEvent(input$btn_clear_all_steps, {
+    step_list(list())
+    showNotification("All steps cleared. Showing original data.", type="warning")
   })
 
-  # Syncs custom JS table click actions directly into active tracking variable
-  observeEvent(input$pbi_col_clicked, {
-    active_profile_col(input$pbi_col_clicked)
-  })
+  # ── TABLE HEADER LEFT-CLICK → active column ───────────────────────────────
+  observeEvent(input$pbi_col_clicked, { active_col(input$pbi_col_clicked) })
 
-  # --- HUBS / POPUPS MANAGER ---
-  observeEvent(input$btn_open_hub, {
-    selected_source(NULL)
-    showModal(modalDialog(
-      title = div(style = "display: flex; align-items: center; justify-content: space-between; width: 100%;",
-                  tags$span(strong("Get Data"), style = "font-size: 1.3rem;"),
-                  div(class = "search-container",
-                      tags$i(class = "fa fa-search"),
-                      textInput("search_source", NULL, placeholder = "Search data sources...", width = "100%")
-                  )
-      ),
-      size = "l",
-      easyClose = TRUE,
-      uiOutput("filtered_sources_ui"),
-      footer = tagList(modalButton("Cancel"), uiOutput("connect_btn_ui"))
-    ))
-  })
+  # ── RIGHT-CLICK → capture targeted column ────────────────────────────────
+  observeEvent(input$ctx_col, { ctx_col(input$ctx_col) })
 
-  all_source_ids <- c("excel", "json", "access", "sqldb", "snow", "sfobj", "sfrep", "gbq", "databr", "py", "rscript")
-  lapply(all_source_ids, function(id) {
-    observeEvent(input[[paste0("select_", id)]], { selected_source(id) })
-  })
+  # ── RIGHT-CLICK ACTION DISPATCH ───────────────────────────────────────────
+  observeEvent(input$ctx_action, {
+    col <- ctx_col()
+    if (is.null(col)) return()
+    active_col(col)  # also update active column
+    pending$action <- input$ctx_action
+    pending$col    <- col
+    df <- dataset(); req(df)
+    is_num <- col %in% colnames(df) && is.numeric(df[[col]])
 
-  output$connect_btn_ui <- renderUI({
-    if (is.null(selected_source())) {
-      actionButton("btn_modal_connect", "Connect", class = "btn btn-success", disabled = TRUE)
-    } else {
-      actionButton("btn_modal_connect", "Connect", class = "btn btn-success")
-    }
-  })
+    switch(input$ctx_action,
 
-  # Launches unique connection configurations matching Power BI setups
-  observeEvent(input$btn_modal_connect, {
-    req(selected_source())
-    src <- selected_source()
-    removeModal()
+           # ── Change Data Type modal ──────────────────────────────────────────
+           "ctx-type" = showModal(modalDialog(
+             title = paste0("Change Data Type — ", col),
+             selectInput("modal_type_choice", "Convert to:",
+                         choices = c("Numeric"="numeric","Text/Character"="character",
+                                     "Factor"="factor","Date"="date","Binary (0/1)"="binary")),
+             footer = tagList(modalButton("Cancel"),
+                              actionButton("modal_type_ok","Apply",class="btn btn-primary")),
+             easyClose = TRUE
+           )),
 
-    form_fields <- switch(src,
-                          "excel" = tagList(
-                            fileInput("pbi_src_file", "File path / Browse", accept = c(".xlsx", ".xls", ".xlsm")),
-                            checkboxInput("pbi_first_row", "Use first row as headers", value = TRUE)
-                          ),
-                          "json" = tagList(
-                            fileInput("pbi_src_file", "File path / Browse", accept = c(".json")),
-                            textInput("pbi_json_root", "JSON Root Element Path (Optional)")
-                          ),
-                          "access" = tagList(
-                            fileInput("pbi_src_file", "Database filename path", accept = c(".accdb", ".mdb")),
-                            passwordInput("pbi_db_pass", "Database Password (if encrypted)")
-                          ),
-                          "sqldb" = tagList(
-                            textInput("pbi_srv", "Server Address", placeholder = "e.g., localhost\\\\SQLEXPRESS or sql.domain.com"),
-                            textInput("pbi_db", "Database (Optional)"),
-                            radioButtons("pbi_mode", "Data Connectivity Mode", choices = c("Import", "DirectQuery"), selected = "Import"),
-                            tags$hr(),
-                            textAreaInput("pbi_sql_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
-                          ),
-                          "snow" = tagList(
-                            textInput("pbi_snow_url", "Server URL", placeholder = "e.g., xy12345.east-us-2.azure.snowflakecomputing.com"),
-                            textInput("pbi_wh", "Warehouse"),
-                            textInput("pbi_db", "Database (Optional)"),
-                            tags$hr(),
-                            textAreaInput("pbi_snow_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
-                          ),
-                          "sfobj" = tagList(
-                            radioButtons("pbi_sf_env_obj", "Salesforce Environment", choices = c("Production", "Custom/Sandbox")),
-                            conditionalPanel(
-                              condition = "input.pbi_sf_env_obj == 'Custom/Sandbox'",
-                              textInput("pbi_sf_url_obj", "Custom Login URL", placeholder = "e.g., https://my-company.sandbox.my.salesforce.com")
-                            ),
-                            checkboxInput("pbi_sf_rel", "Include relationship columns", value = TRUE)
-                          ),
-                          "sfrep" = tagList(
-                            radioButtons("pbi_sf_env_rep", "Salesforce Environment", choices = c("Production", "Custom/Sandbox")),
-                            conditionalPanel(
-                              condition = "input.pbi_sf_env_rep == 'Custom/Sandbox'",
-                              textInput("pbi_sf_url_rep", "Custom Login URL", placeholder = "e.g., https://my-company.sandbox.my.salesforce.com")
-                            ),
-                            textInput("pbi_sf_rep_id", "Specific Report Unique ID")
-                          ),
-                          "gbq" = tagList(
-                            textInput("pbi_gbq_proj", "Project ID", placeholder = "e.g., my-google-project"),
-                            tags$div(style = "margin-top: 15px; margin-bottom: 10px;",
-                                     checkboxInput("pbi_gbq_adv_toggle", strong("Advanced options"), value = FALSE)
-                            ),
-                            conditionalPanel(
-                              condition = "input.pbi_gbq_adv_toggle == true",
-                              tags$div(style = "padding-left: 15px; border-left: 2px solid #cbd5e1; margin-bottom: 15px;",
-                                       textAreaInput("pbi_gbq_sql", "SQL statement", rows = 10, placeholder = "SELECT * FROM `project.dataset.table`", width = "100%"),
-                                       textInput("pbi_gbq_billing", "Billing project ID (Optional)"),
-                                       numericInput("pbi_gbq_limit", "Row limit (Optional)", value = NA)
-                              )
-                            ),
-                            span("Connection will utilize your browser context for OAuth2 validation.", style = "font-size:0.8rem; color:gray;")
-                          ),
-                          "databr" = tagList(
-                            textInput("pbi_srv", "Server Hostname URL"),
-                            textInput("pbi_db", "HTTP Path"),
-                            passwordInput("pbi_pass", "Personal Access Token (PAT)"),
-                            tags$hr(),
-                            textAreaInput("pbi_db_statement", "SQL Statement / Query (Optional)", rows = 5, placeholder = "SELECT * FROM my_table", width = "100%")
-                          ),
-                          "py" = tagList(
-                            textAreaInput("pbi_script_area_py", "Python Script Execution Body", rows = 15, placeholder = "import pandas as pd\\ndf = pd.read_csv('...')", width = "100%"),
-                            span("Execution is processed locally within sandbox instance memory blocks.", style = "font-size:0.8rem; color:gray;")
-                          ),
-                          "rscript" = tagList(
-                            textAreaInput("pbi_script_area_r", "R Script Execution Body", rows = 15, placeholder = "df <- read.csv('...')", width = "100%"),
-                            span("Execution is processed locally within sandbox instance memory blocks.", style = "font-size:0.8rem; color:gray;")
-                          )
+           # ── Round Values modal ──────────────────────────────────────────────
+           "ctx-round" = showModal(modalDialog(
+             title = paste0("Round Values — ", col),
+             if (!is_num) div(class="alert alert-warning","Column is not numeric; convert first.")
+             else numericInput("modal_round_digits","Decimal places:",value=2,min=0,max=10,step=1),
+             footer = tagList(modalButton("Cancel"),
+                              if (is_num) actionButton("modal_round_ok","Apply",class="btn btn-primary")),
+             easyClose = TRUE
+           )),
+
+           # ── Trim Whitespace (no config needed — apply immediately) ──────────
+           "ctx-trim-ws" = {
+             add_step(list(action="trim_whitespace", col=col))
+             showNotification(paste0("Step added: Trim Whitespace on '", col, "'"), type="message")
+           },
+
+           # ── Change Case modal ───────────────────────────────────────────────
+           "ctx-case" = showModal(modalDialog(
+             title = paste0("Change Case — ", col),
+             radioButtons("modal_case_choice","Target case:",
+                          choices=c("UPPERCASE"="upper","lowercase"="lower","Title Case"="title"),
+                          selected="upper", inline=TRUE),
+             footer = tagList(modalButton("Cancel"),
+                              actionButton("modal_case_ok","Apply",class="btn btn-primary")),
+             easyClose = TRUE
+           )),
+
+           # ── Split Column modal ──────────────────────────────────────────────
+           "ctx-split" = showModal(modalDialog(
+             title = paste0("Split Column — ", col),
+             textInput("modal_split_delim","Delimiter character:",value=","),
+             numericInput("modal_split_part","Keep part # (1=left, 2=right…):",value=1,min=1,step=1),
+             span("Column will be replaced with the chosen part.",style="font-size:.8rem;color:#94a3b8;"),
+             footer = tagList(modalButton("Cancel"),
+                              actionButton("modal_split_ok","Apply",class="btn btn-primary")),
+             easyClose = TRUE
+           )),
+
+           # ── Trim by Characters modal ────────────────────────────────────────
+           "ctx-nchar" = showModal(modalDialog(
+             title = paste0("Trim by Characters — ", col),
+             numericInput("modal_nchar_count","Max characters to keep:",value=10,min=1,step=1),
+             radioButtons("modal_nchar_side","Keep from:",
+                          choices=c("Left (start)"="left","Right (end)"="right"),
+                          selected="left",inline=TRUE),
+             footer = tagList(modalButton("Cancel"),
+                              actionButton("modal_nchar_ok","Apply",class="btn btn-primary")),
+             easyClose = TRUE
+           )),
+
+           # ── Handle Missing Values modal ─────────────────────────────────────
+           "ctx-impute" = showModal(modalDialog(
+             title = paste0("Handle Missing Values — ", col),
+             if (is_num) {
+               selectInput("modal_impute_method","Method:",
+                           choices=c("Keep Nulls"="keep","Replace with Mean"="mean",
+                                     "Replace with Median"="median","Drop Nulls"="drop"))
+             } else {
+               tagList(
+                 selectInput("modal_impute_method","Method:",
+                             choices=c("Keep Nulls"="keep","Replace with Value"="constant","Drop Nulls"="drop")),
+                 conditionalPanel(
+                   condition="input.modal_impute_method=='constant'",
+                   textInput("modal_impute_fill","Replace with:",value="Unknown")
+                 )
+               )
+             },
+             footer = tagList(modalButton("Cancel"),
+                              actionButton("modal_impute_ok","Apply",class="btn btn-primary")),
+             easyClose = TRUE
+           )),
+
+           # ── Remove Duplicates (no config) ──────────────────────────────────
+           "ctx-dupes" = {
+             add_step(list(action="remove_duplicates", col=NA))
+             showNotification("Step added: Remove Duplicate Rows", type="message")
+           }
     )
+  })
+
+  # ── MODAL OK HANDLERS ─────────────────────────────────────────────────────
+  observeEvent(input$modal_type_ok, {
+    removeModal()
+    col <- pending$col; req(col)
+    add_step(list(action="convert_type", col=col, to_type=input$modal_type_choice))
+    showNotification(paste0("Step added: Convert '", col, "' to ", input$modal_type_choice), type="message")
+  })
+
+  observeEvent(input$modal_round_ok, {
+    removeModal()
+    col <- pending$col; req(col)
+    add_step(list(action="round_values", col=col, digits=as.integer(input$modal_round_digits)))
+    showNotification(paste0("Step added: Round '", col, "' to ", input$modal_round_digits, " dp"), type="message")
+  })
+
+  observeEvent(input$modal_case_ok, {
+    removeModal()
+    col <- pending$col; req(col)
+    add_step(list(action="change_case", col=col, case=input$modal_case_choice))
+    showNotification(paste0("Step added: Case '", col, "' → ", input$modal_case_choice), type="message")
+  })
+
+  observeEvent(input$modal_split_ok, {
+    removeModal()
+    col <- pending$col; req(col)
+    add_step(list(action="split_column", col=col,
+                  delim=input$modal_split_delim,
+                  part=as.integer(input$modal_split_part)))
+    showNotification(paste0("Step added: Split '", col, "'"), type="message")
+  })
+
+  observeEvent(input$modal_nchar_ok, {
+    removeModal()
+    col <- pending$col; req(col)
+    add_step(list(action="trim_chars", col=col,
+                  nchars=as.integer(input$modal_nchar_count),
+                  side=input$modal_nchar_side))
+    showNotification(paste0("Step added: Trim chars '", col, "'"), type="message")
+  })
+
+  observeEvent(input$modal_impute_ok, {
+    removeModal()
+    col <- pending$col; req(col)
+    method <- input$modal_impute_method
+    if (method == "keep") { showNotification("No imputation applied.", type="warning"); return() }
+    fill_val <- if (!is.null(input$modal_impute_fill) && method=="constant") input$modal_impute_fill else NULL
+    add_step(list(action="impute", col=col, method=method, fill_value=fill_val))
+    showNotification(paste0("Step added: Impute '", col, "' → ", method), type="message")
+  })
+
+  # ── PERSISTENT SIDEBAR BUTTONS ────────────────────────────────────────────
+
+  # Use First Row as Headers — no config needed, add step directly
+  observeEvent(input$btn_use_first_row_hdr, {
+    req(origin_df())
+    add_step(list(action="first_row_headers", col=NA))
+    showNotification("Step added: Use First Row as Headers", type="message")
+  })
+
+  # Execute Column Transforms — a multi-option modal for the active column
+  # (kept as a convenience for users who prefer a form over right-clicking)
+  observeEvent(input$btn_apply_col_trans, {
+    df <- dataset(); req(df)
+    col <- active_col()
+    if (is.null(col) || !(col %in% colnames(df))) {
+      showNotification("No active column selected. Click a column header first.", type="warning")
+      return()
+    }
+    is_num <- is.numeric(df[[col]])
+    pending$col <- col
 
     showModal(modalDialog(
-      title = paste("Connect to", switch(src, "excel"="Excel Workbook", "json"="JSON File", "access"="Access Database", "sqldb"="SQL Server Database", "snow"="Snowflake Storage Engine", "sfobj"="Salesforce Objects Matrix", "sfrep"="Salesforce Analytical Report", "gbq"="Google BigQuery Warehouse", "databr"="Azure Databricks Link", "py"="Python Script Platform", "rscript"="R Script Platform")),
+      title = div(style="display:flex;align-items:center;gap:10px;",
+                  tags$i(class="fa fa-sliders-h",style="color:#10b981;"),
+                  paste0("Column Transforms — ", col)),
       size = "m",
-      easyClose = FALSE,
-      form_fields,
+      # Type
+      div(class="toolkit-section-label","Data Type"),
+      selectInput("exec_type","Convert to:",
+                  choices=c("No Change"="none","Numeric"="numeric","Text/Character"="character",
+                            "Factor"="factor","Date"="date","Binary (0/1)"="binary")),
+      # Rounding
+      if (is_num) tagList(
+        checkboxInput("exec_round_enable","Round numeric values",value=FALSE),
+        conditionalPanel("input.exec_round_enable==true",
+                         numericInput("exec_round_digits","Decimal places:",value=2,min=0,max=10,step=1))
+      ),
+      # String ops (text only)
+      if (!is_num) tagList(
+        div(class="toolkit-section-label","String Operations"),
+        checkboxInput("exec_trim","Trim whitespace",value=FALSE),
+        selectInput("exec_case","Change case:",
+                    choices=c("No Change"="none","UPPERCASE"="upper","lowercase"="lower","Title Case"="title")),
+        checkboxInput("exec_split_enable","Split by delimiter",value=FALSE),
+        conditionalPanel("input.exec_split_enable==true",
+                         textInput("exec_split_delim","Delimiter:",value=","),
+                         numericInput("exec_split_part","Keep part:",value=1,min=1,step=1)),
+        checkboxInput("exec_nchar_enable","Trim to N characters",value=FALSE),
+        conditionalPanel("input.exec_nchar_enable==true",
+                         numericInput("exec_nchar_count","Max characters:",value=10,min=1,step=1),
+                         radioButtons("exec_nchar_side","Keep from:",
+                                      choices=c("Left"="left","Right"="right"),selected="left",inline=TRUE))
+      ),
+      # Imputation
+      div(class="toolkit-section-label","Missing Values"),
+      if (is_num) {
+        selectInput("exec_impute","Handle nulls:",
+                    choices=c("Keep Nulls"="keep","Replace with Mean"="mean","Replace with Median"="median","Drop Nulls"="drop"))
+      } else {
+        tagList(
+          selectInput("exec_impute","Handle nulls:",
+                      choices=c("Keep Nulls"="keep","Replace with Value"="constant","Drop Nulls"="drop")),
+          conditionalPanel("input.exec_impute=='constant'",
+                           textInput("exec_impute_fill","Replace with:",value="Unknown"))
+        )
+      },
       footer = tagList(
-        actionButton("btn_back_to_hub", "← Back", class = "btn btn-outline-secondary"),
         modalButton("Cancel"),
-        actionButton("btn_finalize_connect", "Connect", class = "btn btn-success")
-      )
+        actionButton("exec_modal_ok","Add Steps",class="btn btn-primary")
+      ),
+      easyClose = TRUE
     ))
   })
 
-  observeEvent(input$btn_back_to_hub, {
+  observeEvent(input$exec_modal_ok, {
     removeModal()
-    click("btn_open_hub")
-  })
+    col <- pending$col; req(col)
+    df  <- dataset(); req(df)
+    is_num <- col %in% colnames(df) && is.numeric(df[[col]])
+    added <- 0
 
-  output$filtered_sources_ui <- renderUI({
-    search_term <- if (!is.null(input$search_source)) tolower(input$search_source) else ""
-    all_sources <- list(
-      list(id = "excel",   name = "Excel workbook",        ext = ".xlsx, .xls, .xlsm",    icon = "fa-file-excel icon-excel"),
-      list(id = "json",    name = "JSON file",             ext = ".json, .txt",           icon = "fa-code icon-json"),
-      list(id = "access",  name = "Access database",       ext = ".accdb, .mdb",          icon = "fa-database icon-access"),
-      list(id = "sqldb",   name = "SQL Server database",   ext = "SQL Engine Tables",     icon = "fa-database icon-sql"),
-      list(id = "snow",    name = "Snowflake",             ext = "Snowflake Cloud Wh",    icon = "fa-snowflake icon-snowflake"),
-      list(id = "sfobj",   name = "Salesforce Objects",    ext = "Cloud CRM Tables",      icon = "fa-cloud icon-salesforce"),
-      list(id = "sfrep",   name = "Salesforce Reports",    ext = "CRM Tabular Reports",   icon = "fa-chart-bar icon-salesforce"),
-      list(id = "gbq",     name = "Google BigQuery",       ext = "BigQuery Analytics",    icon = "fa-cloud-meatball icon-google"),
-      list(id = "databr",  name = "Azure Databricks",      ext = "Spark Cluster Lake",    icon = "fa-fire icon-azure"),
-      list(id = "py",      name = "Python script",         ext = "Local script run",      icon = "fa-brands fa-python icon-python"),
-      list(id = "rscript", name = "R script",              ext = "Local script run",      icon = "fa-brands fa-r-project icon-r")
-    )
-    matched <- Filter(function(s) search_term == "" || grepl(search_term, tolower(s$name)) || grepl(search_term, tolower(s$ext)), all_sources)
-    if (length(matched) == 0) {
-      return(div(style = "text-align: center; padding: 40px; color: #94a3b8;",
-                 tags$i(class = "fa fa-search-minus", style = "font-size: 3rem; margin-bottom: 10px;"),
-                 p("No matching data sources found.")))
+    # Type conversion
+    if (!is.null(input$exec_type) && input$exec_type != "none") {
+      add_step(list(action="convert_type",col=col,to_type=input$exec_type)); added <- added+1
+      is_num <- input$exec_type == "numeric"  # update flag for subsequent steps
     }
-    div(class = "source-grid",
-        lapply(matched, function(s) {
-          is_selected <- !is.null(selected_source()) && selected_source() == s$id
-          class_string <- if (is_selected) "source-item-btn selected-item" else "source-item-btn"
-          actionLink(paste0("select_", s$id),
-                     label = div(class = class_string,
-                                 tags$i(class = paste("fa", s$icon)),
-                                 tags$span(s$name, style = "color: #334155; font-weight: 500; font-size: 0.9rem; display:block;"),
-                                 tags$span(s$ext, class = "source-ext-label")
-                     )
-          )
-        })
-    )
+    # Rounding
+    if (is_num && isTRUE(input$exec_round_enable)) {
+      add_step(list(action="round_values",col=col,digits=as.integer(input$exec_round_digits))); added <- added+1
+    }
+    # Trim whitespace
+    if (!is_num && isTRUE(input$exec_trim)) {
+      add_step(list(action="trim_whitespace",col=col)); added <- added+1
+    }
+    # Case
+    if (!is_num && !is.null(input$exec_case) && input$exec_case != "none") {
+      add_step(list(action="change_case",col=col,case=input$exec_case)); added <- added+1
+    }
+    # Split
+    if (!is_num && isTRUE(input$exec_split_enable)) {
+      add_step(list(action="split_column",col=col,
+                    delim=input$exec_split_delim,
+                    part=as.integer(input$exec_split_part))); added <- added+1
+    }
+    # Trim chars
+    if (!is_num && isTRUE(input$exec_nchar_enable)) {
+      add_step(list(action="trim_chars",col=col,
+                    nchars=as.integer(input$exec_nchar_count),
+                    side=input$exec_nchar_side)); added <- added+1
+    }
+    # Imputation
+    if (!is.null(input$exec_impute) && input$exec_impute != "keep") {
+      fill_val <- if (!is.null(input$exec_impute_fill) && input$exec_impute=="constant") input$exec_impute_fill else NULL
+      add_step(list(action="impute",col=col,method=input$exec_impute,fill_value=fill_val)); added <- added+1
+    }
+
+    if (added > 0) showNotification(paste0(added," step(s) added for column '",col,"'"), type="message")
+    else           showNotification("No operations selected.", type="warning")
   })
 
-  # Basic overview textual stats
-  output$dataset_name_ui <- renderText({
-    if (!is.null(connected_data_name())) return(connected_data_name())
-    if (is.null(current_working_data())) "No file loaded" else input$file_input$name
-  })
-  output$dataset_dims_ui <- renderText({ if (is.null(current_working_data())) "0 rows • 0 columns" else paste(nrow(current_working_data()), "rows •", ncol(current_working_data()), "columns") })
-  output$total_rows     <- renderText({ if (is.null(current_working_data())) "0" else nrow(current_working_data()) })
-  output$total_cols     <- renderText({ if (is.null(current_working_data())) "0" else ncol(current_working_data()) })
-  output$missing_count  <- renderText({ if (is.null(current_working_data())) "0" else sum(is.na(current_working_data()) | as.character(current_working_data()) == "") })
-  output$columns_issues <- renderText({ if (is.null(current_working_data())) "0" else sum(sapply(current_working_data(), function(col) any(is.na(col) | as.character(col) == ""))) })
-
-  # --- OVERVIEW DATA DISPLAY CARDS ---
-  output$column_cards_container <- renderUI({
-    df <- current_working_data()
-    if (is.null(df)) return(p("Please upload a dataset file to generate column evaluations.", style = "color: gray; font-style: italic;"))
-
-    col_names <- colnames(df)
-    card_list <- lapply(col_names, function(name) {
-      column_data <- df[[name]]
-      na_count <- sum(is.na(column_data) | as.character(column_data) == "")
-      na_pct <- round((na_count / length(column_data)) * 100, 1)
-      dist_text <- "N/A (Categorical)"
-      outlier_text <- "No outliers"
-      outlier_badge <- "bg-success"
-
-      if (is.numeric(column_data)) {
-        clean_data <- na.omit(column_data)
-        if (length(clean_data) > 3) {
-          m3 <- mean((clean_data - mean(clean_data))^3); s3 <- sd(clean_data)^3; skewness <- if (s3 > 0) m3 / s3 else 0
-          dist_text <- if (abs(skewness) < 0.5) "Normal" else if (skewness >= 0.5) "Right-Skewed" else "Left-Skewed"
-          q25 <- quantile(clean_data, 0.25); q75 <- quantile(clean_data, 0.75); iqr <- q75 - q25
-          outliers <- clean_data[clean_data < (q25 - 1.5*iqr) | clean_data > (q75 + 1.5*iqr)]
-          outlier_pct <- round((length(outliers) / length(clean_data)) * 100, 1)
-          if (length(outliers) > 0) {
-            outlier_text <- paste0(if(outlier_pct > 5) "Big" else "Minor", " Outliers (", outlier_pct, "%)")
-            outlier_badge <- if(outlier_pct > 5) "bg-danger" else "bg-warning text-dark"
-          }
-        }
-      }
-
-      status_class <- if (na_pct > 0) "badge bg-warning text-dark" else "badge bg-success"
-      fill_val <- 100 - na_pct
-
-      card(
-        style = "margin-bottom: 15px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); border-left: 4px solid #10b981;",
-        card_body(
-          div(style = "display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;",
-              tags$strong(name, style = "font-size: 1.1rem; color: #2c3e50;"),
-              span(if (na_pct > 0) "Review" else "Clean", class = status_class)
-          ),
-          div(style = "display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; font-size: 0.85rem; margin-bottom: 10px;",
-              div(tags$span("Nulls: "), tags$strong(paste0(na_pct, "%"))),
-              div(tags$span("Distribution: "), tags$strong(dist_text)),
-              div(tags$span("Outliers: "), span(outlier_text, class = paste("badge", outlier_badge)))
-          ),
-          div(class = "progress", style = "height: 8px;",
-              div(class = paste("progress-bar", if(na_pct > 0) "bg-warning" else "bg-success"), style = paste0("width: ", fill_val, "%;"))
-          )
-        )
-      )
+  # ── GEAR ICON — view step settings ───────────────────────────────────────
+  # The server observes dynamically-named inputs "step_gear_N"
+  observe({
+    steps <- step_list()
+    lapply(seq_along(steps), function(i) {
+      btn_id <- paste0("step_gear_", i)
+      observeEvent(input[[btn_id]], {
+        s <- step_list()[[i]]
+        showModal(modalDialog(
+          title = div(style="display:flex;align-items:center;gap:8px;",
+                      tags$i(class="fa fa-cog",style="color:#475569;"),
+                      paste0("Step ", i, " Settings")),
+          h6(step_label(s), style="color:#64748b;margin-bottom:12px;"),
+          step_settings_html(s),
+          footer = modalButton("Close"),
+          easyClose = TRUE
+        ))
+      }, ignoreInit=TRUE, once=FALSE)
     })
-    do.call(tagList, card_list)
   })
 
-  output$pending_actions_count_ui <- renderText({
-    n <- nrow(actions_log())
-    paste(n, "transformations completed & logged. View history on the Pending Actions page.")
+  # ── X BUTTON — remove step and replay ────────────────────────────────────
+  observe({
+    steps <- step_list()
+    lapply(seq_along(steps), function(i) {
+      btn_id <- paste0("step_remove_", i)
+      observeEvent(input[[btn_id]], {
+        lbl <- step_label(step_list()[[i]])
+        remove_step(i)
+        showNotification(paste0("Removed: ", lbl), type="message")
+      }, ignoreInit=TRUE, once=FALSE)
+    })
   })
 
   observeEvent(input$btn_review, {
-    updateNavsetPill(session, "main_tabs", selected = "Pending actions")
+    updateNavsetPill(session,"main_tabs",selected="Applied Steps Log")
   })
 
-  observeEvent(input$btn_apply, {
-    showNotification("All current cleaning logic passes successfully locked into state!", type = "success")
+  # ── APPLIED STEPS PANEL UI ────────────────────────────────────────────────
+  output$applied_steps_ui <- renderUI({
+    steps <- step_list()
+    if (length(steps) == 0)
+      return(div(class="steps-empty",
+                 tags$i(class="fa fa-stream",style="display:block;font-size:1.5rem;margin-bottom:6px;color:#cbd5e1;"),
+                 "No steps applied yet.", br(),
+                 span("Right-click a column header to begin.",style="font-size:.75rem;")))
+
+    step_items <- lapply(seq_along(steps), function(i) {
+      s <- steps[[i]]
+      div(class="step-item",
+          div(class="step-dot"),
+          div(class="step-label", paste0(i, ". ", step_label(s))),
+          # Gear button — fires step_gear_N
+          tags$button(class="step-gear",
+                      id=paste0("step_gear_",i),
+                      onclick=sprintf("Shiny.setInputValue('step_gear_%d',%d,{priority:'event'});",i,i),
+                      tags$i(class="fa fa-cog")),
+          # X button — fires step_remove_N
+          tags$button(class="step-remove",
+                      id=paste0("step_remove_",i),
+                      onclick=sprintf("Shiny.setInputValue('step_remove_%d',%d,{priority:'event'});",i,i),
+                      tags$i(class="fa fa-times"))
+      )
+    })
+    do.call(div, step_items)
   })
 
-  # --- CUSTOM POWER QUERY DATA TABLE GENERATOR ---
-  output$power_bi_table <- renderUI({
-    df <- current_working_data()
-    if (is.null(df)) return(p("No data loaded. Go to Overview to upload a file.", style = "padding: 20px; font-style: italic; color: #64748b;"))
+  # ── SIDEBAR OUTPUTS ───────────────────────────────────────────────────────
+  output$dataset_name_ui <- renderText({
+    if (!is.null(connected_data_name())) return(connected_data_name())
+    if (is.null(origin_df())) return("No file loaded")
+    if (!is.null(input$file_input)) input$file_input$name else "Loaded"
+  })
+  output$dataset_dims_ui <- renderText({
+    df <- dataset()
+    if (is.null(df)) "0 rows • 0 columns"
+    else paste(nrow(df),"rows •",ncol(df),"columns")
+  })
 
-    preview_df <- head(df, 1000)
-    col_names <- colnames(preview_df)
-    selected_col <- active_profile_col()
+  # ── OVERVIEW VALUE BOXES ──────────────────────────────────────────────────
+  output$total_rows     <- renderText({ df<-dataset(); if(is.null(df))"0" else as.character(nrow(df)) })
+  output$total_cols     <- renderText({ df<-dataset(); if(is.null(df))"0" else as.character(ncol(df)) })
+  output$missing_count  <- renderText({
+    df<-dataset(); if(is.null(df)) "0"
+    else as.character(sum(sapply(df, function(v) sum(is.na(v)|as.character(v)==""))))
+  })
+  output$columns_issues <- renderText({
+    df<-dataset(); if(is.null(df)) "0"
+    else as.character(sum(sapply(df, function(v) any(is.na(v)|as.character(v)==""))))
+  })
+  output$pending_actions_count_ui <- renderText({
+    paste(length(step_list()), "step(s) in the Applied Steps pipeline.")
+  })
 
-    headers <- lapply(col_names, function(col) {
-      col_vec <- df[[col]]
-      total_items <- length(col_vec)
-
-      ui_type <- if(is.numeric(col_vec)) "1.2" else "A B C"
-
-      na_count <- sum(is.na(col_vec) | as.character(col_vec) == "")
-      empty_pct <- round((na_count / total_items) * 100)
-      valid_pct <- 100 - empty_pct
-
-      distinct_cnt <- length(unique(col_vec))
-      unique_cnt <- sum(table(col_vec) == 1)
-
-      is_selected_class <- if(!is.null(selected_col) && selected_col == col) "selected-col-header" else ""
-
-      table_counts <- table(head(col_vec, 100))
-      max_count <- if(length(table_counts) > 0) max(table_counts) else 1
-
-      tags$th(
-        class = is_selected_class,
-        onclick = sprintf("Shiny.setInputValue('pbi_col_clicked', '%s', {priority: 'event'});", col),
-
-        div(class = "header-top-row",
-            div(class = "header-title-text", col),
-            span(ui_type, class = "header-type-label")
-        ),
-
-        if(input$pbi_quality) {
-          div(class = "quality-bar-wrapper",
-              div(class = "quality-bar",
-                  div(class = "q-valid", style = paste0("width: ", valid_pct, "%;")),
-                  div(class = "q-empty", style = paste0("width: ", empty_pct, "%;"))
-              ),
-              div(class = "quality-text-legend",
-                  span(paste0("Valid: ", valid_pct, "%")),
-                  span(paste0("Empty: ", empty_pct, "%"))
-              )
-          )
-        },
-
-        if(input$pbi_dist) {
-          div(class = "mini-dist-container",
-              div(class = "mini-bar-chart",
-                  lapply(head(as.numeric(table_counts), 8), function(val) {
-                    pct_h <- min(100, max(15, round((val / max_count) * 100)))
-                    div(class = "mini-bar", style = paste0("height: ", pct_h, "%;"))
-                  })
-              ),
-              div(class = "mini-dist-counts",
-                  paste0(distinct_cnt, " distinct, ", unique_cnt, " unique")
-              )
-          )
+  # ── COLUMN HEALTH CARDS ───────────────────────────────────────────────────
+  output$column_cards_container <- renderUI({
+    df <- dataset()
+    if (is.null(df)) return(p("Upload a file to generate column evaluations.",style="color:gray;font-style:italic;"))
+    cards <- lapply(colnames(df), function(nm) {
+      cv      <- df[[nm]]
+      na_c    <- sum(is.na(cv)|as.character(cv)=="")
+      na_pct  <- round(na_c/length(cv)*100,1)
+      dlbl    <- "N/A (Categorical)"; olbl <- "No outliers"; ocls <- "bg-success"
+      if (is.numeric(cv)) {
+        cl <- na.omit(cv)
+        if (length(cl)>3) {
+          sk <- tryCatch({m3<-mean((cl-mean(cl))^3);s3<-sd(cl)^3;if(s3>0)m3/s3 else 0},error=function(e)0)
+          dlbl <- if(abs(sk)<0.5)"Normal" else if(sk>=0.5)"Right-Skewed" else "Left-Skewed"
+          q1<-quantile(cl,.25);q3<-quantile(cl,.75);iqr<-q3-q1
+          outs<-cl[cl<q1-1.5*iqr|cl>q3+1.5*iqr]; op<-round(length(outs)/length(cl)*100,1)
+          if(length(outs)>0){olbl<-paste0(if(op>5)"Big" else "Minor"," Outliers (",op,"%)");ocls<-if(op>5)"bg-danger" else "bg-warning text-dark"}
         }
+      }
+      card(style="margin-bottom:15px;box-shadow:0 1px 3px rgba(0,0,0,.05);border-left:4px solid #10b981;",
+           card_body(
+             div(style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;",
+                 tags$strong(nm,style="font-size:1.1rem;color:#2c3e50;"),
+                 span(if(na_pct>0)"Review" else "Clean",class=if(na_pct>0)"badge bg-warning text-dark" else "badge bg-success")),
+             div(style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;font-size:.85rem;margin-bottom:10px;",
+                 div(tags$span("Nulls: "),tags$strong(paste0(na_pct,"%"))),
+                 div(tags$span("Dist: "),tags$strong(dlbl)),
+                 div(tags$span("Outliers: "),span(olbl,class=paste("badge",ocls)))),
+             div(class="progress",style="height:8px;",
+                 div(class=paste("progress-bar",if(na_pct>0)"bg-warning" else "bg-success"),
+                     style=paste0("width:",(100-na_pct),"%;")))
+           ))
+    })
+    do.call(tagList, cards)
+  })
+
+  # ── POWER BI TABLE ────────────────────────────────────────────────────────
+  output$power_bi_table <- renderUI({
+    df <- dataset()
+    if (is.null(df)) return(p("No data loaded.",style="padding:20px;font-style:italic;color:#64748b;"))
+    sel  <- active_col()
+    cols <- colnames(df)
+
+    headers <- lapply(cols, function(col) {
+      cv      <- df[[col]]
+      n       <- length(cv)
+      is_num  <- is.numeric(cv)
+      ui_type <- if(is_num)"1.2" else "A B C"
+      na_c    <- sum(is.na(cv)|as.character(cv)=="")
+      ep      <- round(na_c/n*100); vp <- 100-ep
+      dc      <- length(unique(cv)); uc <- sum(table(cv)==1)
+      sel_cls <- if(!is.null(sel)&&sel==col)"selected-col-header" else ""
+      tbl     <- table(head(cv,100)); mx <- if(length(tbl)>0)max(tbl) else 1
+
+      # data-col and data-numeric attributes are read by the JS right-click handler
+      tags$th(class=sel_cls,
+              `data-col`=col, `data-numeric`=tolower(as.character(is_num)),
+              onclick=sprintf("Shiny.setInputValue('pbi_col_clicked','%s',{priority:'event'});",col),
+              div(class="header-top-row",
+                  div(class="header-title-text",col),
+                  span(ui_type,class="header-type-label")),
+              if(input$pbi_quality)
+                div(class="quality-bar-wrapper",
+                    div(class="quality-bar",
+                        div(class="q-valid",style=paste0("width:",vp,"%;")),
+                        div(class="q-empty",style=paste0("width:",ep,"%;")))
+                    ,div(class="quality-text-legend",
+                         span(paste0("Valid:",vp,"%")),span(paste0("Empty:",ep,"%")))),
+              if(input$pbi_dist)
+                div(class="mini-dist-container",
+                    div(class="mini-bar-chart",
+                        lapply(head(as.numeric(tbl),8),function(v)
+                          div(class="mini-bar",style=paste0("height:",min(100,max(15,round(v/mx*100))),"%;"))))
+                    ,div(class="mini-dist-counts",paste0(dc," distinct, ",uc," unique")))
       )
     })
 
-    rows <- NULL
-    if (nrow(preview_df) > 0) {
-      rows <- lapply(1:nrow(preview_df), function(i) {
-        tags$tr(
-          lapply(col_names, function(col) {
-            val <- preview_df[i, col]
-            cell_class <- if(!is.null(selected_col) && selected_col == col) "selected-col-cell" else ""
-            tags$td(class = cell_class, if(is.na(val) || val == "") tags$em("null", style="color:#cbd5e1;") else htmlEscape(as.character(val)))
-          })
-        )
-      })
-    }
+    preview <- head(df,1000)
+    rows <- lapply(seq_len(nrow(preview)), function(i)
+      tags$tr(lapply(cols, function(col) {
+        v <- preview[i,col]
+        tags$td(class=if(!is.null(sel)&&sel==col)"selected-col-cell" else "",
+                if(is.na(v)||as.character(v)=="") tags$em("null",style="color:#cbd5e1;")
+                else htmlEscape(as.character(v)))
+      })))
 
-    tags$table(class = "pbi-table", tags$thead(tags$tr(headers)), tags$tbody(rows))
+    tags$table(class="pbi-table",tags$thead(tags$tr(headers)),tags$tbody(rows))
   })
 
-  # --- INTERACTIVE COLUMN TRANSFORMATION PANEL ---
-  output$column_transform_ui <- renderUI({
-    df <- current_working_data()
-    req(df)
-    col <- active_profile_col()
-
-    if (is.null(col) || !(col %in% colnames(df))) {
-      return(p("Click a header column to begin transformation configurations.", style = "color: gray; font-style: italic;"))
-    }
-
-    is_num <- is.numeric(df[[col]])
-
-    tagList(
-      p(HTML(paste0("Active Column Target: <strong>", htmlEscape(col), "</strong>"))),
-
-      selectInput("trans_type", "Convert Column Data Type:",
-                  choices = c("No Change" = "none", "Numeric" = "numeric", "Text/Character" = "character", "Factor" = "factor")),
-
-      checkboxInput("trans_trim", "Trim Whitespace (Leading/Trailing)", value = FALSE),
-
-      selectInput("trans_case", "Modify String Case Structure:",
-                  choices = c("No Change" = "none", "UPPERCASE" = "upper", "lowercase" = "lower", "Title Case" = "title")),
-
-      tags$hr(),
-      tags$h6("Handle Missing Values"),
-      if (is_num) {
-        selectInput("impute_numeric_col", "For This Numeric Column:",
-                    choices = c("Keep Nulls" = "keep", "Replace with Mean" = "mean", "Replace with Median" = "median", "Drop Rows" = "drop"))
-      } else {
-        textInput("impute_text_val_col", "For This Text Column (Replace with word):", value = "Unknown")
-      },
-
-      br(),
-      actionButton("btn_apply_col_trans", "Execute Column Transforms", class = "btn-primary w-100 btn-sm")
-    )
-  })
-
-  observeEvent(input$btn_apply_col_trans, {
-    col <- active_profile_col()
-    req(col)
-    df <- current_working_data()
-    req(df)
-
-    actions <- c()
-    details_log <- c()
-
-    # 1. Handling Whitespace Trim
-    if (input$trans_trim) {
-      df[[col]] <- trimws(as.character(df[[col]]))
-      actions <- c(actions, "Trimmed whitespace")
-      details_log <- c(details_log, "Trimmed leading/trailing spaces")
-    }
-
-    # 2. Handling Case Transformations
-    if (input$trans_case == "upper") {
-      df[[col]] <- toupper(as.character(df[[col]]))
-      actions <- c(actions, "Changed Case")
-      details_log <- c(details_log, "Changed case to UPPERCASE")
-    } else if (input$trans_case == "lower") {
-      df[[col]] <- tolower(as.character(df[[col]]))
-      actions <- c(actions, "Changed Case")
-      details_log <- c(details_log, "Changed case to lowercase")
-    } else if (input$trans_case == "title") {
-      df[[col]] <- tools::toTitleCase(tolower(as.character(df[[col]])))
-      actions <- c(actions, "Changed Case")
-      details_log <- c(details_log, "Changed case to Title Case")
-    }
-
-    # 3. Handling Type Conversions
-    if (input$trans_type == "numeric") {
-      df[[col]] <- as.numeric(df[[col]])
-      actions <- c(actions, "Convert Type")
-      details_log <- c(details_log, "Converted layout profile type to Numeric")
-    } else if (input$trans_type == "character") {
-      df[[col]] <- as.character(df[[col]])
-      actions <- c(actions, "Convert Type")
-      details_log <- c(details_log, "Converted layout profile type to Text")
-    } else if (input$trans_type == "factor") {
-      df[[col]] <- as.factor(df[[col]])
-      actions <- c(actions, "Convert Type")
-      details_log <- c(details_log, "Converted layout profile type to Factor")
-    }
-
-    # 4. Handling Column Imputation Rules
-    col_vec <- df[[col]]
-    if (is.numeric(col_vec)) {
-      req(input$impute_numeric_col)
-      na_indices <- which(is.na(col_vec))
-      if (length(na_indices) > 0 && input$impute_numeric_col != "keep") {
-        if (input$impute_numeric_col == "mean") {
-          m_val <- mean(col_vec, na.rm = TRUE)
-          if (is.nan(m_val)) m_val <- 0
-          df[na_indices, col] <- m_val
-          actions <- c(actions, "Impute Numeric")
-          details_log <- c(details_log, paste("Replaced NULLs with Mean =", round(m_val, 2)))
-        } else if (input$impute_numeric_col == "median") {
-          med_val <- median(col_vec, na.rm = TRUE)
-          if (is.na(med_val)) med_val <- 0
-          df[na_indices, col] <- med_val
-          actions <- c(actions, "Impute Numeric")
-          details_log <- c(details_log, paste("Replaced NULLs with Median =", round(med_val, 2)))
-        } else if (input$impute_numeric_col == "drop") {
-          df <- df[-na_indices, , drop = FALSE]
-          actions <- c(actions, "Drop Rows")
-          details_log <- c(details_log, "Dropped row instances with NULLs")
-        }
-      }
-    } else {
-      req(input$impute_text_val_col)
-      na_indices <- which(is.na(col_vec) | as.character(col_vec) == "")
-      if (length(na_indices) > 0) {
-        df[na_indices, col] <- input$impute_text_val_col
-        actions <- c(actions, "Impute Text")
-        details_log <- c(details_log, paste0("Replaced missing blanks with '", input$impute_text_val_col, "'"))
-      }
-    }
-
-    if (length(actions) > 0) {
-      new_rows <- data.frame(
-        Time = rep(format(Sys.time(), "%H:%M:%S"), length(actions)),
-        Column = rep(col, length(actions)),
-        Action = actions,
-        Details = details_log,
-        stringsAsFactors = FALSE
-      )
-      actions_log(rbind(actions_log(), new_rows))
-      modified_data(df)
-      showNotification(paste("Success: Custom updates parsed onto column:", col), type = "message")
-    } else {
-      showNotification("No transformation fields changed.", type = "warning")
-    }
-  })
-
-  # --- BOTTOM PANEL PROFILE STATISTICS METRIC ---
+  # ── COLUMN STATS ──────────────────────────────────────────────────────────
   output$column_stats_table_ui <- renderUI({
-    df <- current_working_data()
-    req(df)
-    col <- active_profile_col()
-    if(is.null(col) || !(col %in% colnames(df))) return(p("Click on a header column.", style="color:#64748b;"))
-
-    col_vec <- df[[col]]
-    total_len <- length(col_vec)
-    na_count <- sum(is.na(col_vec) | as.character(col_vec) == "")
-    distinct_cnt <- length(unique(col_vec))
-    unique_cnt <- sum(table(col_vec) == 1)
-
-    base_rows <- list(
-      tags$tr(tags$td("Count"), tags$td(strong(total_len))),
-      tags$tr(tags$td("Error"), tags$td(strong(0))),
-      tags$tr(tags$td("Empty"), tags$td(strong(na_count))),
-      tags$tr(tags$td("Distinct"), tags$td(strong(distinct_cnt))),
-      tags$tr(tags$td("Unique"), tags$td(strong(unique_cnt)))
+    df <- dataset(); req(df)
+    col <- active_col()
+    if (is.null(col)||!(col%in%colnames(df))) return(p("Click a column.",style="color:#64748b;"))
+    cv <- df[[col]]
+    rows <- list(
+      tags$tr(tags$td("Count"),    tags$td(strong(length(cv)))),
+      tags$tr(tags$td("Empty"),    tags$td(strong(sum(is.na(cv)|as.character(cv)=="")))),
+      tags$tr(tags$td("Distinct"), tags$td(strong(length(unique(cv))))),
+      tags$tr(tags$td("Unique"),   tags$td(strong(sum(table(cv)==1))))
     )
-
-    if(is.numeric(col_vec)) {
-      clean_v <- na.omit(col_vec)
-      numeric_rows <- list(
-        tags$tr(tags$td("Min"), tags$td(strong(if(length(clean_v)>0) min(clean_v) else "N/A"))),
-        tags$tr(tags$td("Max"), tags$td(strong(if(length(clean_v)>0) max(clean_v) else "N/A"))),
-        tags$tr(tags$td("Average"), tags$td(strong(if(length(clean_v)>0) round(mean(clean_v), 4) else "N/A")))
-      )
-      base_rows <- c(base_rows, numeric_rows)
+    if (is.numeric(cv)) {
+      cl <- na.omit(cv)
+      rows <- c(rows,list(
+        tags$tr(tags$td("Min"),     tags$td(strong(if(length(cl)>0)min(cl)           else "N/A"))),
+        tags$tr(tags$td("Max"),     tags$td(strong(if(length(cl)>0)max(cl)           else "N/A"))),
+        tags$tr(tags$td("Mean"),    tags$td(strong(if(length(cl)>0)round(mean(cl),4) else "N/A")))
+      ))
     }
-
-    tags$table(class = "table table-sm table-striped",
-               style = "font-size:0.8rem; margin:0;",
-               tags$tbody(base_rows))
+    tags$table(class="table table-sm table-striped",style="font-size:.8rem;margin:0;",tags$tbody(rows))
   })
 
-  # --- PROFILE CHART LAYER COMPONENT ---
+  # ── ACTIVE COLUMN INFO CARD ───────────────────────────────────────────────
+  output$active_col_info_ui <- renderUI({
+    df  <- dataset()
+    col <- active_col()
+    if (is.null(df)||is.null(col)||!(col%in%colnames(df)))
+      return(p("Right-click a column header to add a step.",style="color:#94a3b8;font-size:.82rem;font-style:italic;"))
+    cv <- df[[col]]
+    tagList(
+      p(strong(col), style="margin-bottom:4px;font-size:.9rem;"),
+      span(class="badge bg-light text-dark",
+           style="border:1px solid #e2e8f0;font-size:.75rem;margin-bottom:8px;",
+           if(is.numeric(cv))"Numeric" else if(is.factor(cv))"Factor" else "Text"),
+      br(), br(),
+      p(style="font-size:.78rem;color:#64748b;",
+        "Right-click the column header to add transformation steps.")
+    )
+  })
+
+  # ── DISTRIBUTION PLOT ─────────────────────────────────────────────────────
   output$profile_histogram_plot <- renderPlot({
-    df <- current_working_data()
-    req(df)
-    col <- active_profile_col()
-    req(col)
-
-    col_vec <- na.omit(df[[col]])
-    if(length(col_vec) == 0) return(NULL)
-
-    plot_df <- data.frame(Value = col_vec)
-
-    if(is.numeric(col_vec)) {
-      ggplot(plot_df, aes(x = Value)) +
-        geom_histogram(fill = "#0ea5e9", color = "#ffffff", bins = 30, alpha = 0.9) +
-        theme_minimal(base_size = 12) +
-        labs(x = NULL, y = NULL) +
-        theme(
-          panel.grid.minor = element_blank(),
-          plot.margin = margin(10, 15, 10, 15)
-        )
+    df  <- dataset(); req(df)
+    col <- active_col(); req(col)
+    if (!(col %in% colnames(df))) return(NULL)
+    cv <- na.omit(df[[col]])
+    if (length(cv)==0) return(NULL)
+    pdf <- data.frame(Value=cv)
+    if (is.numeric(cv)) {
+      ggplot(pdf,aes(x=Value))+geom_histogram(fill="#0ea5e9",color="#fff",bins=30,alpha=.9)+
+        theme_minimal(base_size=11)+labs(x=NULL,y=NULL)+theme(panel.grid.minor=element_blank())
     } else {
-      top_df <- as.data.frame(table(Value = col_vec))
-      top_df <- top_df[order(-top_df$Freq), ]
-      top_df = head(top_df, 15)
-
-      ggplot(top_df, aes(x = reorder(Value, -Freq), y = Freq)) +
-        geom_col(fill = "#0ea5e9", alpha = 0.9, width = 0.75) +
-        theme_minimal(base_size = 12) +
-        labs(x = NULL, y = NULL) +
-        theme(
-          axis.text.x = element_text(angle = 45, hjust = 1),
-          panel.grid.minor = element_blank(),
-          plot.margin = margin(10, 15, 10, 15)
-        )
+      td <- as.data.frame(table(Value=cv))
+      td <- head(td[order(-td$Freq),],15)
+      ggplot(td,aes(x=reorder(Value,-Freq),y=Freq))+geom_col(fill="#0ea5e9",alpha=.9,width=.75)+
+        theme_minimal(base_size=11)+labs(x=NULL,y=NULL)+
+        theme(axis.text.x=element_text(angle=45,hjust=1),panel.grid.minor=element_blank())
     }
   })
 
-  # --- DATA PREVIEW FILTER LOGIC ---
+  # ── PREVIEW TABLE ─────────────────────────────────────────────────────────
   output$preview_data_table <- renderTable({
-    df <- current_working_data()
-    req(df)
-
-    if (input$preview_view_type == "nulls") {
-      has_null <- apply(df, 1, function(row) {
-        any(is.na(row) | as.character(row) == "")
-      })
-      filtered_df <- df[has_null, , drop = FALSE]
-      if (nrow(filtered_df) == 0) {
-        return(data.frame(Message = "No null rows detected inside the current data frame!"))
-      }
-      return(head(filtered_df, 500))
-    } else {
-      return(head(df, 500))
+    df <- dataset(); req(df)
+    if (input$preview_view_type=="nulls") {
+      mask <- apply(df,1,function(r) any(is.na(r)|as.character(r)==""))
+      fd   <- df[mask,,drop=FALSE]
+      if (nrow(fd)==0) return(data.frame(Message="No null rows in current dataset."))
+      return(head(fd,500))
     }
+    head(df,500)
   })
 
-  # --- PENDING ACTIONS ACTION LOG TABLE ---
-  output$pending_actions_table <- renderTable({
-    log_df <- actions_log()
-    if (nrow(log_df) == 0) {
-      return(data.frame(Status = "No custom data adjustments tracked in this log session yet."))
-    }
-    log_df
+  # ── APPLIED STEPS LOG TABLE ───────────────────────────────────────────────
+  output$steps_log_table <- renderTable({
+    steps <- step_list()
+    if (length(steps)==0) return(data.frame(Status="No steps applied yet."))
+    data.frame(
+      `#`      = seq_along(steps),
+      Column   = sapply(steps, function(s) if(is.na(s$col)) "(All)" else s$col),
+      Action   = sapply(steps, function(s) s$action),
+      Summary  = sapply(steps, step_label),
+      stringsAsFactors = FALSE,
+      check.names = FALSE
+    )
   })
 
-  # --- EXPORT INTERACTIVE SYSTEM MODAL ---
-  observeEvent(input$btn_export, {
+  # ── DATA SOURCE HUB ───────────────────────────────────────────────────────
+  observeEvent(input$btn_open_hub, {
+    selected_source(NULL)
     showModal(modalDialog(
-      title = "Export Cleaned Dataset Options",
-      p("Please choose your desired configuration profile file type format below:"),
-      div(style = "display: flex; gap: 12px; justify-content: center; padding: 20px;",
-          downloadButton("download_csv", "CSV File Output", class = "btn-success"),
-          downloadButton("download_txt", "Text (.txt) Output", class = "btn-info text-white"),
-          downloadButton("download_xls", "Excel Workbook Output", class = "btn-primary")
-      ),
-      size = "m",
-      easyClose = TRUE,
-      footer = modalButton("Dismiss")
+      title=div(style="display:flex;align-items:center;justify-content:space-between;width:100%;",
+                tags$span(strong("Get Data"),style="font-size:1.3rem;"),
+                div(class="search-container",
+                    tags$i(class="fa fa-search"),
+                    textInput("search_source",NULL,placeholder="Search data sources…",width="100%"))),
+      size="l",easyClose=TRUE,
+      uiOutput("filtered_sources_ui"),
+      footer=tagList(modalButton("Cancel"),uiOutput("connect_btn_ui"))
     ))
   })
 
-  output$download_csv <- downloadHandler(
-    filename = function() { paste0("cleaned_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv") },
-    content = function(file) { write.csv(current_working_data(), file, row.names = FALSE) }
-  )
+  all_src_ids <- c("excel","json","access","sqldb","snow","sfobj","sfrep","gbq","databr","py","rscript")
+  lapply(all_src_ids, function(id)
+    observeEvent(input[[paste0("select_",id)]], selected_source(id), ignoreInit=TRUE))
 
-  output$download_txt <- downloadHandler(
-    filename = function() { paste0("cleaned_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".txt") },
-    content = function(file) { write.table(current_working_data(), file, sep = "\t", row.names = FALSE, quote = FALSE) }
-  )
+  output$connect_btn_ui <- renderUI({
+    btn <- actionButton("btn_modal_connect","Connect",class="btn btn-success")
+    if (is.null(selected_source())) tagAppendAttributes(btn,disabled=NA) else btn
+  })
 
-  output$download_xls <- downloadHandler(
-    filename = function() { paste0("cleaned_data_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".xls") },
-    content = function(file) { write.table(current_working_data(), file, sep = "\t", row.names = FALSE) }
-  )
+  observeEvent(input$btn_modal_connect, {
+    req(selected_source()); src <- selected_source(); removeModal()
+    form_fields <- switch(src,
+                          "excel"  =tagList(fileInput("pbi_src_file","File path",accept=c(".xlsx",".xls",".xlsm")),checkboxInput("pbi_first_row","Use first row as headers",TRUE)),
+                          "json"   =tagList(fileInput("pbi_src_file","File path",accept=".json"),textInput("pbi_json_root","JSON Root Element (optional)")),
+                          "access" =tagList(fileInput("pbi_src_file","Database path",accept=c(".accdb",".mdb")),passwordInput("pbi_db_pass","Password (if encrypted)")),
+                          "sqldb"  =tagList(textInput("pbi_srv","Server"),textInput("pbi_db","Database (optional)"),radioButtons("pbi_mode","Mode",c("Import","DirectQuery"),"Import"),tags$hr(),textAreaInput("pbi_sql","SQL (optional)",rows=5,width="100%")),
+                          "snow"   =tagList(textInput("pbi_snow_url","Server URL"),textInput("pbi_wh","Warehouse"),textInput("pbi_db","Database (optional)"),tags$hr(),textAreaInput("pbi_snow_sql","SQL (optional)",rows=5,width="100%")),
+                          "sfobj"  =tagList(radioButtons("pbi_sf_env","Environment",c("Production","Custom/Sandbox")),conditionalPanel("input.pbi_sf_env=='Custom/Sandbox'",textInput("pbi_sf_url","Custom Login URL")),checkboxInput("pbi_sf_rel","Include relationship columns",TRUE)),
+                          "sfrep"  =tagList(radioButtons("pbi_sf_env2","Environment",c("Production","Custom/Sandbox")),conditionalPanel("input.pbi_sf_env2=='Custom/Sandbox'",textInput("pbi_sf_url2","Custom Login URL")),textInput("pbi_sf_rep_id","Report ID")),
+                          "gbq"    =tagList(textInput("pbi_gbq_proj","Project ID"),checkboxInput("pbi_gbq_adv","Advanced options",FALSE),conditionalPanel("input.pbi_gbq_adv==true",div(style="padding-left:15px;border-left:2px solid #cbd5e1;",textAreaInput("pbi_gbq_sql","SQL",rows=8,width="100%"),textInput("pbi_gbq_billing","Billing project (optional)"),numericInput("pbi_gbq_limit","Row limit (optional)",NA))),span("Uses browser OAuth2.",style="font-size:.8rem;color:gray;")),
+                          "databr" =tagList(textInput("pbi_srv2","Server Hostname"),textInput("pbi_http","HTTP Path"),passwordInput("pbi_pat","Personal Access Token"),tags$hr(),textAreaInput("pbi_db_sql","SQL (optional)",rows=5,width="100%")),
+                          "py"     =tagList(textAreaInput("pbi_py","Python Script",rows=15,width="100%",placeholder="import pandas as pd\ndf = pd.read_csv('...')"),span("Runs locally.",style="font-size:.8rem;color:gray;")),
+                          "rscript"=tagList(textAreaInput("pbi_r","R Script",rows=15,width="100%",placeholder="df <- read.csv('...')"),span("Runs locally.",style="font-size:.8rem;color:gray;"))
+    )
+    src_label <- switch(src,"excel"="Excel Workbook","json"="JSON File","access"="Access Database","sqldb"="SQL Server","snow"="Snowflake","sfobj"="Salesforce Objects","sfrep"="Salesforce Reports","gbq"="Google BigQuery","databr"="Azure Databricks","py"="Python Script","rscript"="R Script")
+    showModal(modalDialog(
+      title=paste("Connect to",src_label),size="m",easyClose=FALSE,form_fields,
+      footer=tagList(actionButton("btn_back_to_hub","← Back",class="btn btn-outline-secondary"),modalButton("Cancel"),actionButton("btn_finalize_connect","Connect",class="btn btn-success"))
+    ))
+  })
+
+  observeEvent(input$btn_back_to_hub, { removeModal(); click("btn_open_hub") })
+
+  output$filtered_sources_ui <- renderUI({
+    term <- tolower(if(!is.null(input$search_source)) input$search_source else "")
+    srcs <- list(
+      list(id="excel",  name="Excel workbook",      ext=".xlsx, .xls, .xlsm",icon="fa-file-excel icon-excel"),
+      list(id="json",   name="JSON file",           ext=".json, .txt",        icon="fa-code icon-json"),
+      list(id="access", name="Access database",     ext=".accdb, .mdb",       icon="fa-database icon-access"),
+      list(id="sqldb",  name="SQL Server database", ext="SQL Engine",         icon="fa-database icon-sql"),
+      list(id="snow",   name="Snowflake",           ext="Cloud Warehouse",    icon="fa-snowflake icon-snowflake"),
+      list(id="sfobj",  name="Salesforce Objects",  ext="CRM Tables",         icon="fa-cloud icon-salesforce"),
+      list(id="sfrep",  name="Salesforce Reports",  ext="CRM Reports",        icon="fa-chart-bar icon-salesforce"),
+      list(id="gbq",    name="Google BigQuery",     ext="BigQuery",           icon="fa-cloud-meatball icon-google"),
+      list(id="databr", name="Azure Databricks",    ext="Spark Lake",         icon="fa-fire icon-azure"),
+      list(id="py",     name="Python script",       ext="Local run",          icon="fa-brands fa-python icon-python"),
+      list(id="rscript",name="R script",            ext="Local run",          icon="fa-brands fa-r-project icon-r")
+    )
+    m <- Filter(function(s) term==""||grepl(term,tolower(s$name))||grepl(term,tolower(s$ext)), srcs)
+    if (length(m)==0) return(div(style="text-align:center;padding:40px;color:#94a3b8;",
+                                 tags$i(class="fa fa-search-minus",style="font-size:3rem;margin-bottom:10px;"),
+                                 p("No matching data sources found.")))
+    div(class="source-grid",
+        lapply(m, function(s) {
+          cls <- if(!is.null(selected_source())&&selected_source()==s$id)"source-item-btn selected-item" else "source-item-btn"
+          actionLink(paste0("select_",s$id),
+                     label=div(class=cls,tags$i(class=paste("fa",s$icon)),
+                               tags$span(s$name,style="color:#334155;font-weight:500;font-size:.9rem;display:block;"),
+                               tags$span(s$ext,class="source-ext-label")))
+        }))
+  })
+
+  # ── EXPORT ────────────────────────────────────────────────────────────────
+  observeEvent(input$btn_export, {
+    showModal(modalDialog(
+      title="Export Cleaned Dataset",
+      p("Choose output format:"),
+      div(style="display:flex;gap:12px;justify-content:center;padding:20px;",
+          downloadButton("dl_csv","CSV",  class="btn-success"),
+          downloadButton("dl_txt","TXT",  class="btn-info text-white"),
+          downloadButton("dl_xls","Excel",class="btn-primary")),
+      size="m",easyClose=TRUE,footer=modalButton("Dismiss")
+    ))
+  })
+
+  output$dl_csv <- downloadHandler(filename=function() paste0("cleaned_",format(Sys.time(),"%Y%m%d_%H%M%S"),".csv"),  content=function(f) write.csv(dataset(),f,row.names=FALSE))
+  output$dl_txt <- downloadHandler(filename=function() paste0("cleaned_",format(Sys.time(),"%Y%m%d_%H%M%S"),".txt"),  content=function(f) write.table(dataset(),f,sep="\t",row.names=FALSE,quote=FALSE))
+  output$dl_xls <- downloadHandler(filename=function() paste0("cleaned_",format(Sys.time(),"%Y%m%d_%H%M%S"),".xls"),  content=function(f) write.table(dataset(),f,sep="\t",row.names=FALSE))
 }
 
 options(shiny.maxRequestSize = 200 * 1024^2)
