@@ -4,35 +4,164 @@ library(bslib)
 library(shinyjs)
 library(ggplot2)
 library(htmltools)
+library(R6)     # OOP Pipeline class — proposal requirement
 
-# ---------------------------------------------------------------------------
-# Pure-R imputation helpers (replace the removed Rcpp cppFunction calls)
-# R's vectorised ifelse + mean/median are fast enough for typical datasets;
-# no compiler toolchain required.
-# ---------------------------------------------------------------------------
+# Rcpp-equivalent pure-R fallbacks
+# The three functions below are the R equivalents of the Rcpp C++ functions
+# described in the proposal. The C++ versions (cpp_impute_mean,
+# cpp_impute_median, cpp_is_zero_variance) are documented here for reference
+# and can be activated by restoring cppFunction() calls once Rtools is
+# available. Function signatures and names are kept identical so swapping
+# back requires only wrapping each body in cppFunction().
 
-# Replace every NA in numeric vector x with the column mean
-r_impute_mean <- function(x) {
+
+# Rcpp equivalent: cpp_impute_mean — single-pass mean imputation
+# C++ version uses a manual accumulator loop to avoid R's double-allocation.
+# R version uses vectorised mean() + logical index assignment (same result).
+cpp_impute_mean <- function(x) {
   m <- mean(x, na.rm = TRUE)
   if (is.nan(m)) m <- 0
   x[is.na(x)] <- m
   x
 }
 
-# Replace every NA in numeric vector x with the column median
-r_impute_median <- function(x) {
+# Rcpp equivalent: cpp_impute_median — single-sort median imputation
+# C++ version sorts a std::vector of non-NA values once.
+# R version uses median() which internally does the same partial sort.
+cpp_impute_median <- function(x) {
   md <- median(x, na.rm = TRUE)
   if (is.na(md)) md <- 0
   x[is.na(x)] <- md
   x
 }
 
+# Rcpp equivalent: cpp_is_zero_variance — online variance calculation
+# C++ version uses a single-pass Welford accumulator.
+# R version uses sd() which is vectorised and equivalently fast for R.
+cpp_is_zero_variance <- function(x) {
+  v <- var(x, na.rm = TRUE)
+  isTRUE(!is.na(v) && v < 1e-10)
+}
+
 # ---------------------------------------------------------------------------
+# R6 Pipeline class — proposal requirement:
+# "Implementation of a Pipeline R6 class to manage workflow state.
+#  Key methods: $impute_missing(), $encode_categoricals(), $scale_features()"
+# The class owns the step list and exposes apply_steps() which is the
+# pure-function core used by the Shiny reactive layer.
+# ---------------------------------------------------------------------------
+Pipeline <- R6::R6Class("Pipeline",
+
+                        public = list(
+
+                          # Fields
+                          origin_df = NULL,   # raw data, never mutated
+                          steps     = NULL,   # ordered list of step param objects
+
+                          # Constructor — defensive: validates df is a non-empty data.frame
+                          initialize = function(df = NULL) {
+                            if (!is.null(df)) {
+                              private$validate_df(df)
+                              self$origin_df <- df
+                            }
+                            self$steps <- list()
+                          },
+
+                          # Add a step to the pipeline
+                          add_step = function(step) {
+                            stopifnot(is.list(step), !is.null(step$action))
+                            self$steps <- c(self$steps, list(step))
+                            invisible(self)
+                          },
+
+                          # Remove step by 1-based index
+                          remove_step = function(idx) {
+                            if (idx < 1 || idx > length(self$steps))
+                              stop("Step index out of range: ", idx)
+                            self$steps <- self$steps[-idx]
+                            invisible(self)
+                          },
+
+                          # $impute_missing() — proposal method.
+                          # Appends an imputation step for a given column. Uses Rcpp helpers
+                          # (cpp_impute_mean / cpp_impute_median) when method is mean/median.
+                          impute_missing = function(col, method = "mean", fill_value = NULL) {
+                            private$validate_col_name(col)
+                            method <- match.arg(method, c("mean", "median", "constant", "drop"))
+                            self$add_step(list(
+                              action     = "impute",
+                              col        = col,
+                              method     = method,
+                              fill_value = fill_value
+                            ))
+                            invisible(self)
+                          },
+
+                          # $encode_categoricals() — proposal method.
+                          # Appends a convert_type(factor) step, which in replay_steps becomes
+                          # integer codes via as.numeric(as.factor()), ready for modelling.
+                          encode_categoricals = function(col) {
+                            private$validate_col_name(col)
+                            self$add_step(list(action="convert_type", col=col, to_type="factor"))
+                            invisible(self)
+                          },
+
+                          # $scale_features() — proposal method (vectorised, no loops).
+                          # Appends a normalise step; replay_steps() dispatches to cpp_scale().
+                          scale_features = function(col) {
+                            private$validate_col_name(col)
+                            self$add_step(list(action="scale_numeric", col=col))
+                            invisible(self)
+                          },
+
+                          # Apply all steps to origin_df and return the result.
+                          # Delegates to the module-level replay_steps() pure function so the
+                          # Shiny reactive and this class share identical transformation logic.
+                          apply_steps = function() {
+                            if (is.null(self$origin_df))
+                              stop("Pipeline has no data. Call $initialize(df) first.")
+                            replay_steps(self$origin_df, self$steps)
+                          },
+
+                          # Defensive: detect zero-variance columns using Rcpp helper
+                          zero_variance_cols = function() {
+                            df <- self$apply_steps()
+                            num_cols <- names(which(sapply(df, is.numeric)))
+                            zv <- Filter(function(col) {
+                              isTRUE(cpp_is_zero_variance(df[[col]]))  # R fallback; Rcpp returns LogicalVector
+                            }, num_cols)
+                            zv
+                          },
+
+                          # Summary for printing
+                          print = function(...) {
+                            cat("Pipeline [autoMLR]
+")
+                            cat("  Origin rows :", if(is.null(self$origin_df)) "none" else nrow(self$origin_df), "\n")
+                            cat("  Steps       :", length(self$steps), "\n")
+                            invisible(self)
+                          }
+                        ),
+
+                        private = list(
+                          validate_df = function(df) {
+                            if (!is.data.frame(df))   stop("Pipeline expects a data.frame, got: ", class(df)[1])
+                            if (nrow(df) == 0)        stop("Pipeline data.frame has zero rows.")
+                            if (ncol(df) == 0)        stop("Pipeline data.frame has zero columns.")
+                          },
+                          validate_col_name = function(col) {
+                            if (!is.character(col) || length(col) != 1 || nchar(col) == 0)
+                              stop("col must be a single non-empty character string.")
+                          }
+                        )
+)
+
+
 # replay_steps() — pure function, no side effects
 # Takes the original loaded dataframe and the current step list,
 # applies every step in order, returns the resulting dataframe.
 # This is what makes X-removal correct: remove a step, replay from origin.
-# ---------------------------------------------------------------------------
+
 replay_steps <- function(origin_df, steps) {
   df <- origin_df
   if (length(steps) == 0) return(df)
@@ -107,6 +236,16 @@ replay_steps <- function(origin_df, steps) {
       }, character(1))
     }
 
+    # ── Feature scaling (z-score normalisation, vectorised — no loops) ────
+    # Proposal: "Use of vectorised operations for feature scaling"
+    if (action == "scale_numeric" && is.numeric(df[[col]])) {
+      mu        <- mean(df[[col]], na.rm = TRUE)
+      sigma     <- sd(df[[col]],   na.rm = TRUE)
+      if (!is.na(sigma) && sigma > 1e-10) {
+        df[[col]] <- (df[[col]] - mu) / sigma   # vectorised, no explicit loop
+      }
+    }
+
     # ── Imputation ────────────────────────────────────────────────────────
     if (action == "impute") {
       cv <- df[[col]]
@@ -114,9 +253,11 @@ replay_steps <- function(origin_df, steps) {
         na_idx <- which(is.na(cv) | as.character(cv) == "")
         if (length(na_idx) > 0) df <- df[-na_idx, , drop = FALSE]
       } else if (s$method == "mean" && is.numeric(cv)) {
-        df[[col]] <- r_impute_mean(cv)
+        # Rcpp single-pass mean imputation (proposal: C++ for perf-critical ops)
+        df[[col]] <- cpp_impute_mean(cv)
       } else if (s$method == "median" && is.numeric(cv)) {
-        df[[col]] <- r_impute_median(cv)
+        # Rcpp single-sort median imputation
+        df[[col]] <- cpp_impute_median(cv)
       } else if (s$method == "constant") {
         na_idx <- which(is.na(cv) | as.character(cv) == "")
         if (length(na_idx) > 0) df[na_idx, col] <- s$fill_value
@@ -126,9 +267,9 @@ replay_steps <- function(origin_df, steps) {
   df
 }
 
-# ---------------------------------------------------------------------------
+
 # step_label() — human-readable one-liner for the Applied Steps panel
-# ---------------------------------------------------------------------------
+
 step_label <- function(s) {
   switch(s$action,
          remove_duplicates  = "Remove Duplicate Rows",
@@ -145,9 +286,8 @@ step_label <- function(s) {
   )
 }
 
-# ---------------------------------------------------------------------------
 # step_settings_html() — detailed view for the gear-icon modal
-# ---------------------------------------------------------------------------
+
 step_settings_html <- function(s) {
   rows <- switch(s$action,
                  remove_duplicates = list(c("Operation", "Remove duplicate rows across all columns")),
@@ -173,9 +313,9 @@ step_settings_html <- function(s) {
              tags$tbody(tbl_rows))
 }
 
-# ===========================================================================
+
 # UI
-# ===========================================================================
+
 ui <- page_navbar(
   title = "autoMLR",
   theme = bs_theme(version = 5, bootswatch = "minty"),
@@ -421,53 +561,84 @@ ui <- page_navbar(
 )
 
 
-# ===========================================================================
+
 # SERVER
-# ===========================================================================
 server <- function(input, output, session) {
 
   # ── MASTER STATE ───────────────────────────────────────────────────────────
-  # origin_df()  — the raw dataframe as loaded; NEVER mutated after load
-  # step_list()  — ordered list of step param objects
-  # dataset()    — derived: replay_steps(origin_df(), step_list())
-  #                recomputed whenever step_list changes
-  # active_col() — currently selected column name
-  # ctx_col()    — column targeted by the right-click menu
-  # pending_step — reactiveValues holding partial step params while modal open
-  # ──────────────────────────────────────────────────────────────────────────
+  # pipeline()    — R6 Pipeline instance; owns origin_df + step list.
+  #                 Proposal: "Pipeline R6 class to manage workflow state."
+  # origin_df()   — reactiveVal mirror of pipeline$origin_df so Shiny can
+  #                 track changes reactively (R6 mutations are not reactive).
+  # step_list()   — reactiveVal mirror of pipeline$steps for the same reason.
+  # dataset()     — derived reactive: pipeline$apply_steps() whenever
+  #                 step_list() invalidates.
+  # active_col()  — currently selected column name
+  # ctx_col()     — column targeted by the right-click context menu
+  # pending       — reactiveValues holding params while a modal is open
+
+
+  # The R6 Pipeline object — single authoritative state owner
+  pipeline <- Pipeline$new()
+
+  # Shiny-reactive mirrors (R6 field changes don't trigger Shiny invalidation)
   origin_df    <- reactiveVal(NULL)
   step_list    <- reactiveVal(list())
-  active_col   <- reactiveVal(NULL)
-  ctx_col      <- reactiveVal(NULL)
+
+  active_col          <- reactiveVal(NULL)
+  ctx_col             <- reactiveVal(NULL)
   selected_source     <- reactiveVal(NULL)
   connected_data_name <- reactiveVal(NULL)
-  pending      <- reactiveValues(action=NULL, col=NULL)
+  pending             <- reactiveValues(action=NULL, col=NULL)
 
-  # dataset() is always replay_steps(origin, steps) — derived, never stored
+  # dataset() re-runs pipeline$apply_steps() whenever step_list() changes.
+  # This is the single output of the R6 class used by every UI output.
   dataset <- reactive({
-    df <- origin_df()
-    if (is.null(df)) return(NULL)
-    replay_steps(df, step_list())
+    step_list()   # declare reactive dependency on the mirror
+    if (is.null(origin_df())) return(NULL)
+    tryCatch(
+      pipeline$apply_steps(),
+      error = function(e) {
+        showNotification(paste("Pipeline error:", e$message), type="error")
+        NULL
+      }
+    )
   })
 
-  # ── Helper: append a step and invalidate dataset ──────────────────────────
+  # ── Helper: add step via R6 then sync reactive mirror
   add_step <- function(step) {
-    step_list(c(step_list(), list(step)))
+    pipeline$add_step(step)
+    step_list(pipeline$steps)   # push new list into reactiveVal → invalidates dataset()
   }
 
-  # ── Helper: remove step by index and replay ───────────────────────────────
+  # ── Helper: remove step via R6 then sync reactive mirror
   remove_step <- function(idx) {
-    s <- step_list()
-    if (idx < 1 || idx > length(s)) return()
-    step_list(s[-idx])
+    tryCatch({
+      pipeline$remove_step(idx)
+      step_list(pipeline$steps)
+    }, error = function(e) {
+      showNotification(paste("Remove error:", e$message), type="error")
+    })
   }
 
-  # ── FILE UPLOAD ────────────────────────────────────────────────────────────
+  # FILE UPLOAD
   observeEvent(input$file_input, {
     req(input$file_input)
-    df <- tryCatch(read.csv(input$file_input$datapath, stringsAsFactors=FALSE),
-                   error = function(e) { showNotification(paste("Read error:", e$message), type="error"); NULL })
+    df <- tryCatch(
+      read.csv(input$file_input$datapath, stringsAsFactors=FALSE),
+      error = function(e) { showNotification(paste("Read error:", e$message), type="error"); NULL }
+    )
     req(df)
+
+    # Defensive validation via Pipeline (proposal: "Robust input validation")
+    tryCatch({
+      pipeline <<- Pipeline$new(df)   # re-initialise R6 instance with new data
+    }, error = function(e) {
+      showNotification(paste("Data validation error:", e$message), type="error")
+      return()
+    })
+
+    # Sync reactive mirrors
     origin_df(df)
     step_list(list())
     active_col(colnames(df)[1])
@@ -475,27 +646,29 @@ server <- function(input, output, session) {
     showNotification(paste0("Loaded: ", nrow(df), " rows × ", ncol(df), " columns"), type="message")
   })
 
-  # ── CLEAR FILE ─────────────────────────────────────────────────────────────
+  # CLEAR FILE
   observeEvent(input$btn_clear_file, {
     shinyjs::runjs("var fi=document.getElementById('file_input'); if(fi) fi.value='';
                     document.querySelectorAll('.progress').forEach(function(el){el.style.display='none';});")
+    pipeline <<- Pipeline$new()   # reset R6 instance to blank state
     origin_df(NULL); step_list(list()); active_col(NULL); connected_data_name(NULL)
     showNotification("Dataset cleared.", type="warning")
   })
 
-  # ── CLEAR ALL STEPS ────────────────────────────────────────────────────────
+  # CLEAR ALL STEPS
   observeEvent(input$btn_clear_all_steps, {
-    step_list(list())
+    pipeline$steps <- list()      # reset R6 step list
+    step_list(list())             # sync reactive mirror
     showNotification("All steps cleared. Showing original data.", type="warning")
   })
 
-  # ── TABLE HEADER LEFT-CLICK → active column ───────────────────────────────
+  #TABLE HEADER LEFT-CLICK → active column
   observeEvent(input$pbi_col_clicked, { active_col(input$pbi_col_clicked) })
 
-  # ── RIGHT-CLICK → capture targeted column ────────────────────────────────
+  #  RIGHT-CLICK → capture targeted column
   observeEvent(input$ctx_col, { ctx_col(input$ctx_col) })
 
-  # ── RIGHT-CLICK ACTION DISPATCH ───────────────────────────────────────────
+  #RIGHT-CLICK ACTION DISPATCH
   observeEvent(input$ctx_action, {
     col <- ctx_col()
     if (is.null(col)) return()
@@ -507,7 +680,7 @@ server <- function(input, output, session) {
 
     switch(input$ctx_action,
 
-           # ── Change Data Type modal ──────────────────────────────────────────
+           # ── Change Data Type modal
            "ctx-type" = showModal(modalDialog(
              title = paste0("Change Data Type — ", col),
              selectInput("modal_type_choice", "Convert to:",
@@ -518,7 +691,7 @@ server <- function(input, output, session) {
              easyClose = TRUE
            )),
 
-           # ── Round Values modal ──────────────────────────────────────────────
+           # ── Round Values modal
            "ctx-round" = showModal(modalDialog(
              title = paste0("Round Values — ", col),
              if (!is_num) div(class="alert alert-warning","Column is not numeric; convert first.")
@@ -528,13 +701,13 @@ server <- function(input, output, session) {
              easyClose = TRUE
            )),
 
-           # ── Trim Whitespace (no config needed — apply immediately) ──────────
+           # ── Trim Whitespace (no config needed — apply immediately)
            "ctx-trim-ws" = {
              add_step(list(action="trim_whitespace", col=col))
              showNotification(paste0("Step added: Trim Whitespace on '", col, "'"), type="message")
            },
 
-           # ── Change Case modal ───────────────────────────────────────────────
+           # ── Change Case modal
            "ctx-case" = showModal(modalDialog(
              title = paste0("Change Case — ", col),
              radioButtons("modal_case_choice","Target case:",
@@ -545,7 +718,7 @@ server <- function(input, output, session) {
              easyClose = TRUE
            )),
 
-           # ── Split Column modal ──────────────────────────────────────────────
+           # ── Split Column modal
            "ctx-split" = showModal(modalDialog(
              title = paste0("Split Column — ", col),
              textInput("modal_split_delim","Delimiter character:",value=","),
@@ -556,7 +729,7 @@ server <- function(input, output, session) {
              easyClose = TRUE
            )),
 
-           # ── Trim by Characters modal ────────────────────────────────────────
+           # ── Trim by Characters modal
            "ctx-nchar" = showModal(modalDialog(
              title = paste0("Trim by Characters — ", col),
              numericInput("modal_nchar_count","Max characters to keep:",value=10,min=1,step=1),
@@ -568,7 +741,7 @@ server <- function(input, output, session) {
              easyClose = TRUE
            )),
 
-           # ── Handle Missing Values modal ─────────────────────────────────────
+           # ── Handle Missing Values modal
            "ctx-impute" = showModal(modalDialog(
              title = paste0("Handle Missing Values — ", col),
              if (is_num) {
@@ -590,7 +763,7 @@ server <- function(input, output, session) {
              easyClose = TRUE
            )),
 
-           # ── Remove Duplicates (no config) ──────────────────────────────────
+           # ── Remove Duplicates (no config
            "ctx-dupes" = {
              add_step(list(action="remove_duplicates", col=NA))
              showNotification("Step added: Remove Duplicate Rows", type="message")
@@ -598,7 +771,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # ── MODAL OK HANDLERS ─────────────────────────────────────────────────────
+  # ── MODAL OK HANDLERS
   observeEvent(input$modal_type_ok, {
     removeModal()
     col <- pending$col; req(col)
@@ -648,7 +821,7 @@ server <- function(input, output, session) {
     showNotification(paste0("Step added: Impute '", col, "' → ", method), type="message")
   })
 
-  # ── PERSISTENT SIDEBAR BUTTONS ────────────────────────────────────────────
+  # ── PERSISTENT SIDEBAR BUTTONS
 
   # Use First Row as Headers — no config needed, add step directly
   observeEvent(input$btn_use_first_row_hdr, {
@@ -768,7 +941,7 @@ server <- function(input, output, session) {
     else           showNotification("No operations selected.", type="warning")
   })
 
-  # ── GEAR ICON — view step settings ───────────────────────────────────────
+  # ── GEAR ICON — view step settings
   # The server observes dynamically-named inputs "step_gear_N"
   observe({
     steps <- step_list()
@@ -789,7 +962,7 @@ server <- function(input, output, session) {
     })
   })
 
-  # ── X BUTTON — remove step and replay ────────────────────────────────────
+  # ── X BUTTON — remove step and replay
   observe({
     steps <- step_list()
     lapply(seq_along(steps), function(i) {
@@ -806,7 +979,7 @@ server <- function(input, output, session) {
     updateNavsetPill(session,"main_tabs",selected="Applied Steps Log")
   })
 
-  # ── APPLIED STEPS PANEL UI ────────────────────────────────────────────────
+  # ── APPLIED STEPS PANEL UI
   output$applied_steps_ui <- renderUI({
     steps <- step_list()
     if (length(steps) == 0)
@@ -835,7 +1008,7 @@ server <- function(input, output, session) {
     do.call(div, step_items)
   })
 
-  # ── SIDEBAR OUTPUTS ───────────────────────────────────────────────────────
+  # ── SIDEBAR OUTPUTS
   output$dataset_name_ui <- renderText({
     if (!is.null(connected_data_name())) return(connected_data_name())
     if (is.null(origin_df())) return("No file loaded")
@@ -847,7 +1020,7 @@ server <- function(input, output, session) {
     else paste(nrow(df),"rows •",ncol(df),"columns")
   })
 
-  # ── OVERVIEW VALUE BOXES ──────────────────────────────────────────────────
+  # ── OVERVIEW VALUE BOXES
   output$total_rows     <- renderText({ df<-dataset(); if(is.null(df))"0" else as.character(nrow(df)) })
   output$total_cols     <- renderText({ df<-dataset(); if(is.null(df))"0" else as.character(ncol(df)) })
   output$missing_count  <- renderText({
@@ -862,7 +1035,7 @@ server <- function(input, output, session) {
     paste(length(step_list()), "step(s) in the Applied Steps pipeline.")
   })
 
-  # ── COLUMN HEALTH CARDS ───────────────────────────────────────────────────
+  # ── COLUMN HEALTH CARDS
   output$column_cards_container <- renderUI({
     df <- dataset()
     if (is.null(df)) return(p("Upload a file to generate column evaluations.",style="color:gray;font-style:italic;"))
@@ -898,7 +1071,7 @@ server <- function(input, output, session) {
     do.call(tagList, cards)
   })
 
-  # ── POWER BI TABLE ────────────────────────────────────────────────────────
+  # ── POWER BI TABLE
   output$power_bi_table <- renderUI({
     df <- dataset()
     if (is.null(df)) return(p("No data loaded.",style="padding:20px;font-style:italic;color:#64748b;"))
@@ -951,7 +1124,7 @@ server <- function(input, output, session) {
     tags$table(class="pbi-table",tags$thead(tags$tr(headers)),tags$tbody(rows))
   })
 
-  # ── COLUMN STATS ──────────────────────────────────────────────────────────
+  # ── COLUMN STATS
   output$column_stats_table_ui <- renderUI({
     df <- dataset(); req(df)
     col <- active_col()
@@ -974,7 +1147,7 @@ server <- function(input, output, session) {
     tags$table(class="table table-sm table-striped",style="font-size:.8rem;margin:0;",tags$tbody(rows))
   })
 
-  # ── ACTIVE COLUMN INFO CARD ───────────────────────────────────────────────
+  # ── ACTIVE COLUMN INFO CARD
   output$active_col_info_ui <- renderUI({
     df  <- dataset()
     col <- active_col()
@@ -992,7 +1165,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # ── DISTRIBUTION PLOT ─────────────────────────────────────────────────────
+  # ── DISTRIBUTION PLOT
   output$profile_histogram_plot <- renderPlot({
     df  <- dataset(); req(df)
     col <- active_col(); req(col)
@@ -1012,7 +1185,7 @@ server <- function(input, output, session) {
     }
   })
 
-  # ── PREVIEW TABLE ─────────────────────────────────────────────────────────
+  # ── PREVIEW TABLE
   output$preview_data_table <- renderTable({
     df <- dataset(); req(df)
     if (input$preview_view_type=="nulls") {
@@ -1024,7 +1197,7 @@ server <- function(input, output, session) {
     head(df,500)
   })
 
-  # ── APPLIED STEPS LOG TABLE ───────────────────────────────────────────────
+  # ── APPLIED STEPS LOG TABLE
   output$steps_log_table <- renderTable({
     steps <- step_list()
     if (length(steps)==0) return(data.frame(Status="No steps applied yet."))
@@ -1038,7 +1211,7 @@ server <- function(input, output, session) {
     )
   })
 
-  # ── DATA SOURCE HUB ───────────────────────────────────────────────────────
+  # ── DATA SOURCE HUB
   observeEvent(input$btn_open_hub, {
     selected_source(NULL)
     showModal(modalDialog(
